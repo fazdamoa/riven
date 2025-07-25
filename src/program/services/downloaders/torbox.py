@@ -153,6 +153,57 @@ class TorBoxDownloader(DownloaderBase):
             logger.error(f"Failed to get instant availability for {infohash}: {e}")
             return None
 
+    def get_instant_availability_or_download(self, infohash: str, item_type: str) -> Optional[TorrentContainer]:
+        """
+        Check if torrent is cached. If cached, return container.
+        If not cached, add to TorBox for download and return None.
+        """
+        try:
+            # First check if cached using the dedicated endpoint
+            response = self.api.request_handler.execute(
+                HttpMethod.GET,
+                f"torrents/checkcached?hash={infohash}&format=object&list_files=true",
+            )
+            
+            if response and response.get(infohash):
+                # Torrent is cached
+                logger.info(f"Torrent {infohash} is cached, using instant download")
+                
+                response_data = response.get(infohash, {})
+                torrent_files = []
+                
+                files = response_data.get("files", [])
+                for file_id, file in enumerate(files):
+                    try:
+                        debrid_file = DebridFile.create(
+                            path=file["name"],
+                            filename=file["name"].split("/")[-1],
+                            filesize_bytes=file["size"],
+                            filetype=item_type,
+                            file_id=file_id
+                        )
+                        if isinstance(debrid_file, DebridFile):
+                            torrent_files.append(debrid_file)
+                    except InvalidDebridFileException as e:
+                        logger.debug(f"{infohash}: {e}")
+                        continue
+
+                if torrent_files:
+                    return TorrentContainer(infohash=infohash, files=torrent_files)
+            else:
+                # Torrent is not cached, add it for download
+                logger.info(f"Torrent {infohash} is not cached, adding for download")
+                try:
+                    self.add_torrent(infohash)
+                except Exception as e:
+                    logger.error(f"Failed to add torrent {infohash} for download: {e}")
+                    
+            return None
+            
+        except Exception as e:
+            logger.error(f"Failed to check availability for {infohash}: {e}")
+            return None
+
     def _process_torrent(self, torrent_id: str, infohash: str, item_type: str) -> Optional[TorrentContainer]:
         """Process a single torrent and return a TorrentContainer if valid."""
         torrent_info = self.get_torrent_info(torrent_id)

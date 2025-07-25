@@ -106,45 +106,141 @@ class RealDebridDownloader(DownloaderBase):
         """
         Get instant availability for a single infohash.
         Creates a makeshift availability check since Real-Debrid no longer supports instant availability.
+        NOW MODIFIED: Will keep uncached torrents for download instead of deleting them.
+        """
+        logger.debug(f"[OLD METHOD UPDATED] get_instant_availability called for {infohash}")
+        
+        # Just call our new method to maintain consistent behavior
+        return self.get_instant_availability_or_download(infohash, item_type)
+
+    def get_instant_availability_or_download(self, infohash: str, item_type: str) -> Optional[TorrentContainer]:
+        """
+        Enhanced method to properly detect cached torrents and handle uncached ones.
+        If cached, return container and delete torrent.
+        If not cached, keep torrent for download and return None.
         """
         container: Optional[TorrentContainer] = None
         torrent_id = None
 
         try:
+            logger.debug(f"[ENHANCED RD] Checking availability for torrent {infohash}")
+            
+            # Enhanced check for existing torrents with better status handling
+            existing_torrent = self._find_existing_torrent(infohash)
+            if existing_torrent:
+                logger.debug(f"Found existing torrent {existing_torrent['id']} for {infohash}")
+                
+                # If already downloaded/cached, process immediately
+                if existing_torrent['status'] == "downloaded":
+                    logger.log("DEBRID", f"Torrent {infohash} is already cached in RD")
+                    container = self._process_torrent(existing_torrent['id'], infohash, item_type)
+                    if container:
+                        logger.debug(f"Successfully processed existing cached torrent {existing_torrent['id']}")
+                        return container
+                    else:
+                        logger.debug(f"Failed to process existing cached torrent {existing_torrent['id']}, will try adding new one")
+                
+                # If downloading, return None but don't add another copy
+                elif existing_torrent['status'] in ("downloading", "queued", "waiting_files_selection"):
+                    logger.log("DEBRID", f"Torrent {infohash} is already downloading in RD (status: {existing_torrent['status']})")
+                    return None
+                
+                # If in error state or other status, continue to try adding new one
+                else:
+                    logger.debug(f"Existing torrent {existing_torrent['id']} has status {existing_torrent['status']}, will try adding new one")
+            
+            # If no existing torrent found, or existing one couldn't be processed, add new one
+            logger.debug(f"Adding new torrent for {infohash}")
             torrent_id = self.add_torrent(infohash)
+            logger.debug(f"Added torrent {infohash} with ID {torrent_id}")
+            
+            # Process the newly added torrent using original logic
             container = self._process_torrent(torrent_id, infohash, item_type)
+            
+            if container is not None:
+                # Torrent is cached (had files after processing)
+                logger.log("DEBRID", f"Torrent {infohash} is cached, using instant download")
+                try:
+                    self.delete_torrent(torrent_id)
+                    logger.debug(f"Deleted cached torrent {torrent_id}")
+                except Exception as e:
+                    logger.error(f"Failed to delete cached torrent {torrent_id}: {e}")
+                return container
+            else:
+                # Torrent is not cached - keep it for download
+                logger.log("DEBRID", f"Torrent {infohash} is not cached, keeping for download")
+                return None
+                
         except InvalidDebridFileException as e:
             logger.debug(f"{infohash}: {e}")
-        except exceptions.ReadTimeout as e:
-            logger.debug(f"Failed to get instant availability for {infohash}: [ReadTimeout] {e}")
-        except Exception as e:
-            if len(e.args) > 0:
-                if " 503 " in e.args[0] or "Infringing" in e.args[0]:
-                    logger.debug(f"Failed to get instant availability for {infohash}: [503] Infringing Torrent or Service Unavailable")
-                elif " 429 " in e.args[0] or "Rate Limit Exceeded" in e.args[0]:
-                    logger.debug(f"Failed to get instant availability for {infohash}: [429] Rate Limit Exceeded")
-                elif " 404 " in e.args[0] or "Torrent Not Found" in e.args[0]:
-                    logger.debug(f"Failed to get instant availability for {infohash}: [404] Torrent Not Found or Service Unavailable")
-                elif " 400 " in e.args[0] or "Torrent file is not valid" in e.args[0]:
-                    logger.debug(f"Failed to get instant availability for {infohash}: [400] Torrent file is not valid")
-            else:
-                logger.error(f"Failed to get instant availability for {infohash}: {e}")
-        finally:
+            # Still cleanup failed torrents
             if torrent_id is not None:
                 try:
                     self.delete_torrent(torrent_id)
-                except Exception as e:
-                    logger.error(f"Failed to delete torrent {torrent_id}: {e}")
+                except Exception as cleanup_e:
+                    logger.error(f"Failed to delete torrent {torrent_id}: {cleanup_e}")
+        except exceptions.ReadTimeout as e:
+            logger.debug(f"Failed to get availability for {infohash}: [ReadTimeout] {e}")
+            if torrent_id is not None:
+                try:
+                    self.delete_torrent(torrent_id)
+                except Exception as cleanup_e:
+                    logger.error(f"Failed to delete torrent {torrent_id}: {cleanup_e}")
+        except Exception as e:
+            # Enhanced error handling with specific error types
+            error_msg = str(e)
+            if "503" in error_msg or "Infringing" in error_msg:
+                logger.debug(f"Failed to get availability for {infohash}: [503] Infringing Torrent")
+            elif "429" in error_msg or "Rate Limit" in error_msg:
+                logger.debug(f"Failed to get availability for {infohash}: [429] Rate Limit Exceeded")
+            elif "404" in error_msg or "Not Found" in error_msg:
+                logger.debug(f"Failed to get availability for {infohash}: [404] Torrent Not Found")
+            elif "400" in error_msg or "not valid" in error_msg:
+                logger.debug(f"Failed to get availability for {infohash}: [400] Invalid Torrent")
+            else:
+                logger.error(f"Failed to get availability for {infohash}: {e}")
+            
+            # Cleanup failed torrents
+            if torrent_id is not None:
+                try:
+                    self.delete_torrent(torrent_id)
+                except Exception as cleanup_e:
+                    logger.error(f"Failed to delete torrent {torrent_id}: {cleanup_e}")
 
-        return container
+        return None
+
+    def _find_existing_torrent(self, infohash: str) -> Optional[dict]:
+        """
+        Find an existing torrent by infohash in the user's Real-Debrid account.
+        Enhanced with better hash comparison and logging.
+        """
+        try:
+            torrents = self.api.request_handler.execute(HttpMethod.GET, "torrents")
+            search_hash = infohash.lower().strip()
+            
+            for torrent in torrents:
+                torrent_hash = torrent.get("hash", "").lower().strip()
+                if torrent_hash == search_hash:
+                    logger.debug(f"Found existing torrent {torrent['id']} for {infohash} with status {torrent.get('status', 'unknown')}")
+                    return torrent
+            
+            logger.debug(f"No existing torrent found for {infohash} in {len(torrents)} torrents")
+            return None
+        except Exception as e:
+            logger.debug(f"Failed to check existing torrents: {e}")
+            return None
 
     def _process_torrent(self, torrent_id: str, infohash: str, item_type: str) -> Optional[TorrentContainer]:
         """Process a single torrent and return a TorrentContainer if valid."""
+        logger.debug(f"Processing torrent {torrent_id} for infohash {infohash}")
+        
         torrent_info = self.get_torrent_info(torrent_id)
         if not torrent_info:
             logger.debug(f"No torrent info found for {torrent_id} with infohash {infohash}")
             return None
 
+        logger.debug(f"Torrent {torrent_id} ({infohash}) has status: {torrent_info.status}")
+        
         torrent_files = []
 
         if not torrent_info.files:
@@ -152,6 +248,7 @@ class RealDebridDownloader(DownloaderBase):
             return None
 
         if torrent_info.status == "waiting_files_selection":
+            logger.debug(f"Torrent {torrent_id} waiting for file selection")
             video_file_ids = [
                 file_id for file_id, file_info in torrent_info.files.items()
                 if file_info["filename"].endswith(tuple(ext.lower() for ext in VALID_VIDEO_EXTENSIONS))
@@ -161,10 +258,13 @@ class RealDebridDownloader(DownloaderBase):
                 logger.debug(f"No video files found in torrent {torrent_id} with infohash {infohash}")
                 return None
 
+            logger.debug(f"Selecting {len(video_file_ids)} video files for torrent {torrent_id}")
             self.select_files(torrent_id, video_file_ids)
             torrent_info = self.get_torrent_info(torrent_id)
+            logger.debug(f"After file selection, torrent {torrent_id} status: {torrent_info.status}")
 
         if torrent_info.status == "downloaded":
+            logger.debug(f"Processing files for downloaded torrent {torrent_id}")
             for file_id, file_info in torrent_info.files.items():
                 try:
                     debrid_file = DebridFile.create(
@@ -185,18 +285,11 @@ class RealDebridDownloader(DownloaderBase):
                 logger.debug(f"No valid files found after validating files in torrent {torrent_id} with infohash {infohash}")
                 return None
 
+            logger.debug(f"Successfully processed {len(torrent_files)} files for torrent {torrent_id}")
             return TorrentContainer(infohash=infohash, files=torrent_files)
 
-        if torrent_info.status in ("downloading", "queued"):
-            # TODO: add support for downloading torrents
-            logger.debug(f"Skipping torrent {torrent_id} with infohash {infohash} because it is downloading. Torrent status on Real-Debrid: {torrent_info.status}")
-            return None
-
-        # if torrent_info.status in ("magnet_error", "error", "virus", "dead", "compressing", "uploading"):
-        #     logger.debug(f"Torrent {torrent_id} with infohash {infohash} is invalid. Torrent status on Real-Debrid: {torrent_info.status}")
-        #     return None
-
-        logger.debug(f"Torrent {torrent_id} with infohash {infohash} is invalid. Torrent status on Real-Debrid: {torrent_info.status}")
+        # For any other status, this torrent is not ready for file processing
+        logger.debug(f"Torrent {torrent_id} with infohash {infohash} has status '{torrent_info.status}', not ready for file processing")
         return None
 
     def add_torrent(self, infohash: str) -> str:

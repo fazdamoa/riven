@@ -59,11 +59,18 @@ class Scraping:
 
         if self.can_we_scrape(item):
             sorted_streams = self.scrape(item)
-            new_streams = [
-                stream for stream in sorted_streams.values()
-                if stream not in item.streams
-                and stream not in item.blacklisted_streams
-            ]
+            logger.debug(f"Scraper found {len(sorted_streams)} total streams for {item.log_string}")
+            logger.debug(f"Item has {len(item.streams)} existing streams and {len(item.blacklisted_streams)} blacklisted streams")
+            
+            new_streams = []
+            for stream in sorted_streams.values():
+                if stream in item.streams:
+                    logger.debug(f"Stream {stream.infohash} already in item.streams")
+                elif stream in item.blacklisted_streams:
+                    logger.debug(f"Stream {stream.infohash} is blacklisted, skipping")
+                else:
+                    logger.debug(f"Stream {stream.infohash} is new and will be added")
+                    new_streams.append(stream)
 
             if new_streams:
                 item.streams.extend(new_streams)

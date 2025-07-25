@@ -46,8 +46,15 @@ class Downloader:
         logger.debug(f"Starting download process for {item.log_string} ({item.id})")
 
         if item.file or item.active_stream or item.last_state in [States.Completed, States.Symlinked, States.Downloaded]:
-            logger.debug(f"Skipping {item.log_string} ({item.id}) as it has already been downloaded by another download session")
-            yield item
+            # Check if item is stuck with active_stream but still in Scraped state
+            if item.active_stream and item.last_state == States.Scraped:
+                logger.log("DEBRID", f"Resetting stuck item {item.log_string} ({item.id}) - has active_stream but still in Scraped state")
+                item.active_stream = None  # Reset the stuck state
+                # Continue processing instead of skipping
+            else:
+                logger.debug(f"Skipping {item.log_string} ({item.id}) as it has already been downloaded by another download session. Details: file={bool(item.file)}, active_stream={bool(item.active_stream)}, last_state={item.last_state}")
+                yield item
+                return
 
         if item.is_parent_blocked():
             logger.debug(f"Skipping {item.log_string} ({item.id}) as it has a blocked parent, or is a blocked item")
@@ -58,31 +65,95 @@ class Downloader:
             yield item
 
         download_success = False
-        for stream in item.streams:
-            container: Optional[TorrentContainer] = self.validate_stream(stream, item)
-            if not container:
-                continue
-
-            try:
-                download_result = self.download_cached_stream(stream, container)
-                if self.update_item_attributes(item, download_result):
-                    logger.log("DEBRID", f"Downloaded {item.log_string} from '{stream.raw_title}' [{stream.infohash}]")
-                    download_success = True
-                    break
-                else:
-                    raise NoMatchingFilesException(f"No valid files found for {item.log_string} ({item.id})")
-            except Exception as e:
-                logger.debug(f"Stream {stream.infohash} failed: {e}")
-                if 'download_result' in locals() and download_result.id:
+        
+        # PRIORITY-AWARE LOGIC: Check for cached streams first, then uncached
+        if item.streams:
+            streams_to_try = [s for s in item.streams[:5] if s not in item.blacklisted_streams]  # Try top 5 non-blacklisted streams
+            
+            if not streams_to_try:
+                logger.debug(f"All top streams are blacklisted for {item.log_string}")
+                yield item
+                return
+            
+            # PHASE 1: Look for cached streams first (highest priority)
+            logger.debug(f"Phase 1: Checking {len(streams_to_try)} streams for cached availability")
+            cached_streams = []
+            
+            for stream in streams_to_try:
+                try:
+                    container: Optional[TorrentContainer] = self.validate_stream_for_cache_or_download(stream, item)
+                    if container:
+                        # Found cached stream - add to cached list with priority
+                        cached_streams.append((stream, container))
+                        logger.log("DEBRID", f"Found cached stream: {stream.raw_title} [{stream.infohash}] (rank: {stream.rank})")
+                except Exception as e:
+                    error_msg = str(e)
+                    logger.debug(f"Error checking cache for {stream.infohash}: {e}")
+                    
+                    # Only blacklist permanent errors during cache check
+                    if any(error in error_msg for error in [
+                        "Infringing", "Invalid", "Not Found", "503", "400"
+                    ]):
+                        logger.debug(f"Blacklisting {stream.infohash} due to permanent error: {error_msg}")
+                        item.blacklist_stream(stream)
+            
+            # PHASE 2: Download best cached stream if any found
+            if cached_streams:
+                # Sort by rank to ensure we get the best cached stream
+                cached_streams.sort(key=lambda x: x[0].rank, reverse=True)  # Higher rank = better
+                best_cached_stream, container = cached_streams[0]
+                
+                logger.log("DEBRID", f"Downloading best cached stream: {best_cached_stream.raw_title} [{best_cached_stream.infohash}] (rank: {best_cached_stream.rank})")
+                
+                try:
+                    download_result = self.download_cached_stream(best_cached_stream, container)
+                    if self.update_item_attributes(item, download_result):
+                        logger.log("DEBRID", f"Downloaded {item.log_string} from cached '{best_cached_stream.raw_title}' [{best_cached_stream.infohash}]")
+                        download_success = True
+                    else:
+                        logger.debug(f"No matching files found for cached torrent {best_cached_stream.infohash}")
+                        item.blacklist_stream(best_cached_stream)
+                except Exception as e:
+                    logger.debug(f"Failed to download cached stream {best_cached_stream.infohash}: {e}")
+                    item.blacklist_stream(best_cached_stream)
+            
+            # PHASE 3: If no cached streams worked, try downloading best uncached stream
+            if not download_success and streams_to_try:
+                # Find the best uncached stream (highest rank that wasn't cached)
+                uncached_streams = [s for s in streams_to_try if not any(s == cached[0] for cached in cached_streams)]
+                
+                if uncached_streams:
+                    best_uncached_stream = uncached_streams[0]  # Already sorted by rank
+                    logger.log("DEBRID", f"No cached streams available, starting download of best uncached: {best_uncached_stream.raw_title} [{best_uncached_stream.infohash}] (rank: {best_uncached_stream.rank})")
+                    
                     try:
-                        self.service.delete_torrent(download_result.id)
-                        logger.debug(f"Deleted failed torrent {stream.infohash} for {item.log_string} ({item.id}) on debrid service.")
+                        download_result = self.download_uncached_stream(best_uncached_stream, item)
+                        if download_result:
+                            if download_result.container and download_result.container.files:
+                                # Became cached during setup
+                                if self.update_item_attributes(item, download_result):
+                                    logger.log("DEBRID", f"Downloaded {item.log_string} from '{best_uncached_stream.raw_title}' [{best_uncached_stream.infohash}] (became cached)")
+                                    download_success = True
+                                else:
+                                    logger.debug(f"Failed to update item attributes for cached torrent {best_uncached_stream.infohash}")
+                                    item.blacklist_stream(best_uncached_stream)
+                            else:
+                                # Truly uncached - mark as downloading
+                                logger.log("DEBRID", f"Started download for {item.log_string} from '{best_uncached_stream.raw_title}' [{best_uncached_stream.infohash}]")
+                                # Consider this a success for uncached downloads
                     except Exception as e:
-                        logger.debug(f"Failed to delete torrent {stream.infohash} for {item.log_string} ({item.id}) on debrid service: {e}")
-                item.blacklist_stream(stream)
+                        error_msg = str(e)
+                        logger.debug(f"Failed to set up download for {best_uncached_stream.infohash}: {e}")
+                        
+                        # Only blacklist permanent errors
+                        if any(error in error_msg for error in [
+                            "Infringing", "Invalid", "Not Found", "503", "400"
+                        ]):
+                            logger.debug(f"Blacklisting {best_uncached_stream.infohash} due to permanent error: {error_msg}")
+                            item.blacklist_stream(best_uncached_stream)
 
         if not download_success:
-            logger.debug(f"Failed to download any streams for {item.log_string} ({item.id})")
+            logger.debug(f"No streams successfully processed for {item.log_string} ({item.id})")
 
         yield item
 
@@ -120,6 +191,52 @@ class Downloader:
             container.files = valid_files
             return container
 
+        item.blacklist_stream(stream)
+        return None
+
+    def validate_stream_for_cache_or_download(self, stream: Stream, item: MediaItem) -> Optional[TorrentContainer]:
+        """
+        Check if stream is cached. If cached, return container for immediate download.
+        If not cached, add to debrid service for download and return None.
+        """
+        logger.debug(f"[NEW METHOD] Validating stream {stream.infohash} for {item.log_string}")
+        
+        # Use the modified Real-Debrid function that doesn't delete uncached torrents
+        container = self.get_instant_availability_or_download(stream.infohash, item.type)
+        
+        if not container:
+            logger.debug(f"Stream {stream.infohash} is not cached, was added for download")
+            # Don't blacklist - we want to keep this torrent downloading
+            return None
+
+        logger.debug(f"Stream {stream.infohash} is cached, validating files")
+        # If we get here, the torrent was cached
+        valid_files = []
+        for file in container.files or []:
+            if isinstance(file, DebridFile):
+                valid_files.append(file)
+                continue
+
+            try:
+                debrid_file = DebridFile.create(
+                    filename=file.filename,
+                    filesize_bytes=file.filesize,
+                    filetype=item.type,
+                    file_id=file.file_id
+                )
+
+                if isinstance(debrid_file, DebridFile):
+                    valid_files.append(debrid_file)
+            except InvalidDebridFileException as e:
+                logger.debug(f"{stream.infohash}: {e}")
+                continue
+
+        if valid_files:
+            logger.debug(f"Found {len(valid_files)} valid files for cached stream {stream.infohash}")
+            container.files = valid_files
+            return container
+
+        logger.debug(f"No valid files found for cached stream {stream.infohash}, blacklisting")
         item.blacklist_stream(stream)
         return None
 
@@ -208,6 +325,69 @@ class Downloader:
             self.select_files(torrent_id, container.file_ids)
         return DownloadedTorrent(id=torrent_id, info=info, infohash=stream.infohash, container=container)
 
+    def download_uncached_stream(self, stream: Stream, item: MediaItem) -> Optional[DownloadedTorrent]:
+        """Set up download for an uncached stream"""
+        try:
+            logger.debug(f"Setting up uncached download for {stream.infohash}")
+            
+            # Check if torrent already exists in Real-Debrid
+            existing_torrent = self.service._find_existing_torrent(stream.infohash)
+            if existing_torrent:
+                logger.debug(f"Found existing torrent {existing_torrent['id']} for {stream.infohash}")
+                torrent_id = existing_torrent['id']
+            else:
+                # Add new torrent
+                torrent_id = self.add_torrent(stream.infohash)
+                logger.debug(f"Added new torrent {torrent_id} for {stream.infohash}")
+            
+            # Get torrent info
+            info: TorrentInfo = self.get_torrent_info(torrent_id)
+            logger.debug(f"Torrent {torrent_id} status: {info.status}")
+            
+            # If waiting for file selection, select video files
+            if info.status == "waiting_files_selection":
+                logger.debug(f"Selecting video files for torrent {torrent_id}")
+                from program.services.downloaders.models import VALID_VIDEO_EXTENSIONS
+                
+                video_file_ids = []
+                for file_id, file_info in info.files.items():
+                    filename = file_info.get("filename", "")
+                    if filename.endswith(tuple(ext.lower() for ext in VALID_VIDEO_EXTENSIONS)):
+                        video_file_ids.append(int(file_id))
+                
+                if video_file_ids:
+                    self.select_files(torrent_id, video_file_ids)
+                    logger.debug(f"Selected {len(video_file_ids)} video files for torrent {torrent_id}")
+                    # Get updated info after file selection
+                    info = self.get_torrent_info(torrent_id)
+                    logger.debug(f"After file selection, torrent {torrent_id} status: {info.status}")
+                else:
+                    logger.debug(f"No video files found in torrent {torrent_id}")
+                    return None
+            
+            # Check if torrent became cached during the process
+            if info.status == "downloaded":
+                logger.log("DEBRID", f"Torrent {stream.infohash} became cached during setup, processing as cached download")
+                # Create a container from the downloaded torrent
+                container = self.service._process_torrent(torrent_id, stream.infohash, item.type)
+                if container:
+                    return DownloadedTorrent(id=torrent_id, info=info, infohash=stream.infohash, container=container)
+                else:
+                    logger.debug(f"Failed to process cached torrent {torrent_id}")
+                    return None
+            
+            # For uncached torrents (downloading/queued), create a minimal container
+            # This is needed because DownloadedTorrent requires a container
+            from program.services.downloaders.models import TorrentContainer
+            minimal_container = TorrentContainer(infohash=stream.infohash, files=[])
+            
+            # Return a DownloadedTorrent object so Riven can track it
+            return DownloadedTorrent(id=torrent_id, info=info, infohash=stream.infohash, container=minimal_container)
+            
+        except Exception as e:
+            logger.error(f"Failed to set up uncached download for {stream.infohash}: {e}")
+            return None
+
     def _update_attributes(self, item: Union[Movie, Episode], debrid_file: DebridFile, download_result: DownloadedTorrent) -> None:
         """Update the item attributes with the downloaded files and active stream"""
         item.file = debrid_file.filename
@@ -218,6 +398,13 @@ class Downloader:
     def get_instant_availability(self, infohash: str, item_type: str) -> List[TorrentContainer]:
         """Check if the torrent is cached"""
         return self.service.get_instant_availability(infohash, item_type)
+
+    def get_instant_availability_or_download(self, infohash: str, item_type: str) -> Optional[TorrentContainer]:
+        """
+        Check if torrent is cached. If cached, return container for immediate download.
+        If not cached, add to debrid service for download and return None.
+        """
+        return self.service.get_instant_availability_or_download(infohash, item_type)
 
     def add_torrent(self, infohash: str) -> int:
         """Add a torrent by infohash"""

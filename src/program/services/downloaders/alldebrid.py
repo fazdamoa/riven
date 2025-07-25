@@ -163,6 +163,68 @@ class AllDebridDownloader(DownloaderBase):
                 self.delete_torrent(torrent_id)
             return return_value
 
+    def get_instant_availability_or_download(self, infohash: str, item_type: str) -> Optional[TorrentContainer]:
+        """
+        Check if torrent is cached. If cached, return container and delete torrent.
+        If not cached, keep torrent for download and return None.
+        """
+        torrent_id = None
+        return_value = None
+
+        try:
+            torrent_id = self.add_torrent(infohash)
+            time.sleep(1)
+            info = self.get_torrent_info(torrent_id)
+            
+            if info.status == "Ready":
+                # Torrent is cached
+                logger.info(f"Torrent {infohash} is cached, using instant download")
+                files = self.get_files_and_links(torrent_id)
+                processed_files = []
+                
+                def process_entry(entry):
+                    if isinstance(entry, dict):
+                        # file entries
+                        if 'n' in entry and 's' in entry and 'l' in entry:
+                            if debrid_file := DebridFile.create(
+                                filename=entry['n'],
+                                filesize_bytes=entry['s'],
+                                filetype=item_type
+                            ):
+                                processed_files.append(debrid_file)
+                        # directory entries
+                        elif 'e' in entry:
+                            for sub_entry in entry['e']:
+                                process_entry(sub_entry)
+
+                for file_entry in files:
+                    process_entry(file_entry)
+
+                if processed_files:
+                    return_value = TorrentContainer(infohash=infohash, files=processed_files)
+                    
+                # Delete the cached torrent since we have the info
+                self.delete_torrent(torrent_id)
+                torrent_id = None  # Prevent deletion in finally block
+            else:
+                # Torrent is not cached, keep it for download
+                logger.info(f"Torrent {infohash} is not cached, keeping for download")
+                torrent_id = None  # Prevent deletion in finally block
+                
+        except InvalidDebridFileException as e:
+            logger.debug(f"{infohash}: {e}")
+        except Exception as e:
+            logger.error(f"Failed to get instant availability: {e}")
+        finally:
+            # Only delete if there was an error and torrent_id is still set
+            if torrent_id:
+                try:
+                    self.delete_torrent(torrent_id)
+                except Exception as e:
+                    logger.error(f"Failed to delete torrent {torrent_id}: {e}")
+                    
+        return return_value
+
     def add_torrent(self, infohash: str) -> str:
         """
         Add a torrent by infohash

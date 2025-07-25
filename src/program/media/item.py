@@ -189,6 +189,17 @@ class MediaItem(db.Model):
             logger.debug(f"Blacklisted stream {stream.infohash} for {self.log_string}")
         return value
 
+    def retry_blacklisted_streams(self):
+        """Move blacklisted streams back to regular streams for retry"""
+        from program.db.db_functions import unblacklist_stream
+        
+        streams_to_retry = list(self.blacklisted_streams)  # Copy the list
+        for stream in streams_to_retry:
+            unblacklist_stream(self, stream)
+            logger.debug(f"Moved blacklisted stream {stream.infohash} back to regular streams for retry")
+        
+        return len(streams_to_retry)
+
     @property
     def is_released(self) -> bool:
         """Check if an item has been released."""
