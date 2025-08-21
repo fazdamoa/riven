@@ -92,6 +92,12 @@ def _parse_results(item: MediaItem, results: Dict[str, str], log_msg: bool = Tru
                         logger.debug(f"Skipping torrent with too few seasons for {item.log_string}: {raw_title}")
                     continue
 
+            # DV+HDR compatibility filter: If torrent has DV, it must also have HDR
+            if _has_dv_without_hdr(raw_title):
+                if scraping_settings.parse_debug:
+                    logger.debug(f"Skipping DV-only torrent (no HDR) for {item.log_string}: {raw_title}")
+                continue
+
             torrents.add(torrent)
             processed_infohashes.add(infohash)
         except Exception as e:
@@ -150,3 +156,30 @@ def _get_infohash_from_torrent_url(url: str) -> str:
         info = torrent_dict[b'info']
         infohash = hashlib.sha1(encode(info)).hexdigest()
     return infohash
+
+
+def _has_dv_without_hdr(raw_title: str) -> bool:
+    """Check if torrent has Dolby Vision (DV) but no HDR capability.
+    
+    Args:
+        raw_title: The raw torrent title to check
+        
+    Returns:
+        True if torrent has DV but no HDR (should be filtered out)
+        False if torrent is acceptable (no DV, or has both DV and HDR)
+    """
+    title_upper = raw_title.upper()
+    
+    # Check for Dolby Vision indicators
+    dv_indicators = ['DV', 'DOLBY.VISION', 'DOLBYVISION', 'DOLBY VISION']
+    has_dv = any(indicator in title_upper for indicator in dv_indicators)
+    
+    if not has_dv:
+        return False  # No DV, so it's fine
+    
+    # Has DV, now check for HDR indicators
+    hdr_indicators = ['HDR', 'HDR10', 'HDR10+', 'HDR10PLUS']
+    has_hdr = any(indicator in title_upper for indicator in hdr_indicators)
+    
+    # Return True if has DV but no HDR (should be filtered out)
+    return not has_hdr
