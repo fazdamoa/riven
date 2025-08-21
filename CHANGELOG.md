@@ -1,5 +1,69 @@
 # Changelog
 
+## [0.23.5](https://github.com/rivenmedia/riven/compare/v0.23.4...v0.23.5) (2025-08-20)
+
+
+### Bug Fixes
+
+* temporarily use fixed plexapi dependency from fork ([#1135](https://github.com/rivenmedia/riven/issues/1135)) ([e1fcb49](https://github.com/rivenmedia/riven/commit/e1fcb495f1e38c73c043c2416f932b834e391936))
+
+## [0.23.4](https://github.com/rivenmedia/riven/compare/v0.23.3...v0.23.4) (2025-08-15)
+
+
+### Bug Fixes
+
+* check for valid symlink video types on db reinit ([c61074f](https://github.com/rivenmedia/riven/commit/c61074f36a39418ac6f73fe2f7684d90115e31d3))
+
+## [0.23.3](https://github.com/rivenmedia/riven/compare/v0.23.2...v0.23.3) (2025-08-15)
+
+
+### Bug Fixes
+
+* add more parent item data ([25e6810](https://github.com/rivenmedia/riven/commit/25e681055c255d50421cad762d2a3c5fae9100c3))
+
+## [0.23.2](https://github.com/rivenmedia/riven/compare/v0.23.1...v0.23.2) (2025-08-14)
+
+
+### Bug Fixes
+
+* add proxy_url setting for trakt ([44fb11b](https://github.com/rivenmedia/riven/commit/44fb11b28a9a0782b40941f47ddaf228e2539e4e))
+* added default 10s max delay limit to fix hanging in RD requests ([50a1714](https://github.com/rivenmedia/riven/commit/50a1714a059afa8140a6c00b01b66a5f0c6a65c7))
+
+## [0.23.1](https://github.com/rivenmedia/riven/compare/v0.23.0...v0.23.1) (2025-08-10)
+
+
+### Bug Fixes
+
+* fixed notadirectoryerror on re-init symlinks ([ff97b5c](https://github.com/rivenmedia/riven/commit/ff97b5c4806be568f62a08fb014f035aa0a719bc))
+
+## [0.23.0](https://github.com/rivenmedia/riven/compare/v0.22.0...v0.23.0) (2025-08-06)
+
+
+### Features
+
+* **api:** added reindex api route to manually reindex items ([ed80503](https://github.com/rivenmedia/riven/commit/ed80503d106e510966040915742e16dfeb7603e7))
+
+
+### Bug Fixes
+
+* swapped to use trakt indexer directly on reindex route ([315fc29](https://github.com/rivenmedia/riven/commit/315fc29461a435dd4710657ecd1231bf0da8b2bf))
+
+## [0.22.0](https://github.com/rivenmedia/riven/compare/v0.21.21...v0.22.0) (2025-08-05)
+
+
+### Features
+
+* Add TorBox downloader to Riven ([#1074](https://github.com/rivenmedia/riven/issues/1074)) ([9875109](https://github.com/rivenmedia/riven/commit/9875109e25c3c67cc3cdcd2cd450547dce365854))
+* add TRAKT_API_CLIENT_ID env to override the default trakt client id used by trakt indexer ([7fd087f](https://github.com/rivenmedia/riven/commit/7fd087f7b46cde4b6542f1d57ca394a1b4bf28ca))
+* set the media type when performing search ([#1110](https://github.com/rivenmedia/riven/issues/1110)) ([16ada64](https://github.com/rivenmedia/riven/commit/16ada643305024ac3e1b3b7f8defc1faef6aa77e))
+
+
+### Bug Fixes
+
+* fixed hanging on downloader. improved logging. ([#1116](https://github.com/rivenmedia/riven/issues/1116)) ([422db78](https://github.com/rivenmedia/riven/commit/422db783e1a3f07262601478841d9576d70cb332))
+* handle create_item_from_imdb_id response exception ([d91dd25](https://github.com/rivenmedia/riven/commit/d91dd254c08fbb410706d4fc6cb97f3691ebc67c))
+* readtimeout issue with rd, updated timeout to 25s instead of 15s. added exception handling for this as well. ([45105db](https://github.com/rivenmedia/riven/commit/45105dbd70854d70c56f4ebec3d6ca6ea7ef1504))
+
 ## [0.21.21](https://github.com/rivenmedia/riven/compare/v0.21.20...v0.21.21) (2025-05-12)
 
 
