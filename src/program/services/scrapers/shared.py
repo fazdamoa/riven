@@ -22,7 +22,9 @@ from program.utils.request import (
 
 scraping_settings = settings_manager.settings.scraping
 ranking_settings = settings_manager.settings.ranking
-ranking_model = models.get(ranking_settings.profile)
+# Get profile from settings if available, otherwise use 'default'
+profile_name = getattr(ranking_settings, 'profile', 'default')
+ranking_model = models.get(profile_name)
 rtn = RTN(ranking_settings, ranking_model)
 
 

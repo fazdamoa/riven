@@ -48,6 +48,10 @@ class Observable(MigratableBaseModel):
 class RealDebridModel(Observable):
     enabled: bool = False
     api_key: str = ""
+    # If true, automatically select all files when Real-Debrid reports
+    # the torrent status as 'waiting_files_selection'. This avoids needing
+    # to manually select files via the Real-Debrid web UI.
+    auto_select_all_files: bool = True
 
 
 class AllDebridModel(Observable):

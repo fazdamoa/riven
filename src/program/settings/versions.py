@@ -1,5 +1,12 @@
 from loguru import logger
-from RTN.models import BaseRankingModel, BestRanking, DefaultRanking
+from RTN.models import BaseRankingModel, DefaultRanking
+
+# Try to import BestRanking, fall back to DefaultRanking if not available
+try:
+    from RTN.models import BestRanking
+except ImportError:
+    logger.warning("BestRanking not available in RTN, using DefaultRanking as fallback")
+    BestRanking = DefaultRanking
 
 
 class RankModels:

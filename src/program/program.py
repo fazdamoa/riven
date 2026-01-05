@@ -212,11 +212,47 @@ class Program(threading.Thread):
             else:
                 logger.log("PROGRAM", "No items required state updates")
 
+    def _check_active_downloads(self) -> None:
+        """Check status of active Real-Debrid downloads and process completed ones."""
+        try:
+            downloader = self.services.get(Downloader)
+            if not downloader or not downloader.initialized:
+                return
+            
+            processed = downloader.check_active_downloads()
+            
+            if processed > 0:
+                logger.log("PROGRAM", f"Checked {processed} active downloads")
+                
+                # Trigger state transitions for any items that completed
+                from program.services.downloaders.torrent_download import TorrentDownload, TorrentDownloadStatus
+                with db.Session() as session:
+                    ready_downloads = TorrentDownload.get_ready_downloads(session)
+                    for download in ready_downloads:
+                        self.em.add_event(Event(emitted_by="DownloadChecker", item_id=download.media_item_id))
+        except Exception as e:
+            logger.error(f"Error checking active downloads: {e}")
+
+    def _cleanup_download_records(self) -> None:
+        """Clean up old completed/failed download records."""
+        try:
+            downloader = self.services.get(Downloader)
+            if not downloader or not downloader.initialized:
+                return
+            
+            deleted = downloader.cleanup_old_downloads(days=30)
+            if deleted > 0:
+                logger.log("PROGRAM", f"Cleaned up {deleted} old download records")
+        except Exception as e:
+            logger.error(f"Error cleaning up download records: {e}")
+
     def _schedule_functions(self) -> None:
         """Schedule each service based on its update interval."""
         scheduled_functions = {
             self._update_ongoing: {"interval": 60 * 60 * 4},
             self._retry_library: {"interval": 60 * 60 * 24},
+            self._check_active_downloads: {"interval": 60 * 5},  # Check every 5 minutes
+            self._cleanup_download_records: {"interval": 60 * 60 * 24},  # Daily cleanup
             log_cleaner: {"interval": 60 * 60},
             vacuum_and_analyze_index_maintenance: {"interval": 60 * 60 * 24},
         }

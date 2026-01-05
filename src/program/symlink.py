@@ -129,10 +129,16 @@ class Symlinker:
     def _should_submit(self, items: Union[Movie, Show, Season, Episode]) -> bool:
         """Check if the item should be submitted for symlink creation."""
         random_item = random.choice(items)
-        if not _get_item_path(random_item):
-            return False
-        else:
-            return True
+        path = _get_item_path(random_item)
+        
+        if not path:
+            # Try triggering a Zurg refresh and check again
+            if _trigger_zurg_refresh():
+                import time
+                time.sleep(2)  # Give Zurg a moment to refresh
+                path = _get_item_path(random_item)
+        
+        return path is not None
 
     def _get_items_to_update(self, item: Union[Movie, Show, Season, Episode]) -> List[Union[Movie, Episode]]:
         if item.type in ["movie", "episode"]:
@@ -305,25 +311,93 @@ def _delete_symlink(item: Union[Movie, Show], item_path: Path) -> bool:
     return False
 
 def _get_item_path(item: Union[Movie, Episode]) -> Optional[Path]:
-    """Quickly check if the file exists in the rclone path."""
+    """Quickly check if the file exists in the rclone path.
+    
+    Handles multiple scenarios:
+    1. File in subfolder: rclone_path/folder/file.mkv
+    2. File in root (Zurg __all__ style): rclone_path/file.mkv
+    3. File with alternative folder names
+    """
     if not item.file:
+        logger.debug(f"No file set for {item.log_string}")
         return None
 
     rclone_path = Path(settings_manager.settings.symlink.rclone_path)
-    possible_folders = [item.folder, item.file, item.alternative_folder]
-    possible_folders_without_duplicates = list(set(possible_folders))
-    if len(possible_folders_without_duplicates) == 1:
-        new_possible_folder = Path(possible_folders_without_duplicates[0]).with_suffix("")
-        possible_folders_without_duplicates.append(new_possible_folder)
+    logger.debug(f"Looking for file '{item.file}' in rclone_path: {rclone_path}")
+    
+    # First, check if the file exists directly in the rclone root
+    # This handles Zurg's __all__ folder where files are flat
+    file_in_root = rclone_path / item.file
+    if file_in_root.exists() and file_in_root.is_file():
+        logger.debug(f"Found file in root: {file_in_root}")
+        return file_in_root
+    else:
+        logger.debug(f"File not in root: {file_in_root} (exists={file_in_root.exists()})")
+    
+    # Also check item.folder directly in case it's a flat path
+    if item.folder:
+        folder_as_file = rclone_path / item.folder
+        if folder_as_file.exists() and folder_as_file.is_file():
+            logger.debug(f"Found folder as file: {folder_as_file}")
+            return folder_as_file
+    
+    # Try different folder combinations
+    possible_folders = [item.folder, item.alternative_folder]
+    # Also try the filename without extension as a folder name
+    if item.file:
+        possible_folders.append(Path(item.file).stem)
+    
+    # Remove None and duplicates
+    possible_folders = list(set(f for f in possible_folders if f))
 
-    for folder in possible_folders_without_duplicates:
+    for folder in possible_folders:
         if folder:
             file_path = rclone_path / folder / item.file
             if file_path.exists():
                 return file_path
-
-    # Not in a folder? Perhaps it's just sitting in the root.
-    file = rclone_path / item.file
-    if file.exists() and file.is_file():
-        return file
+    
+    # Try searching recursively (slower but more thorough)
+    # This handles cases where Zurg organizes files differently
+    try:
+        for path in rclone_path.rglob(item.file):
+            if path.is_file():
+                logger.debug(f"Found file via rglob: {path}")
+                return path
+    except Exception as e:
+        logger.debug(f"rglob search failed: {e}")
+    
+    # Try to force a directory refresh by listing the directory
+    # This can help with Zurg/rclone cache issues
+    try:
+        list(rclone_path.iterdir())
+    except Exception:
+        pass
+    
+    logger.debug(f"File not found anywhere in rclone_path for {item.log_string}: file='{item.file}', folder='{item.folder}'")
     return None
+
+
+def _trigger_zurg_refresh() -> bool:
+    """
+    Try to trigger a Zurg refresh to update the file listing.
+    This helps when files are added to RD but Zurg hasn't seen them yet.
+    """
+    import requests
+    
+    # Common Zurg endpoints
+    zurg_urls = [
+        "http://localhost:9999/http/dav",  # Default Zurg WebDAV
+        "http://zurg:9999/http/dav",        # Docker network name
+    ]
+    
+    for url in zurg_urls:
+        try:
+            # A PROPFIND request forces Zurg to refresh its cache
+            response = requests.request("PROPFIND", url, timeout=5)
+            if response.status_code in (200, 207, 401):
+                logger.debug(f"Triggered Zurg refresh via {url}")
+                return True
+        except Exception:
+            continue
+    
+    return False
