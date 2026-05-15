@@ -36,6 +36,15 @@ class ScraperRequestHandler(BaseRequestHandler):
         return super()._request(method, endpoint, overriden_response_type=overriden_response_type, **kwargs)
 
 
+def _get_min_rank_for_item(item: MediaItem) -> int:
+    """Return the configured minimum rank threshold for this item's media type."""
+    ranking = settings_manager.settings.ranking
+    if item.type == "movie":
+        return ranking.min_rank_movie
+    # show / season / episode all use the show threshold
+    return ranking.min_rank_show
+
+
 def _parse_results(item: MediaItem, results: Dict[str, str], log_msg: bool = True) -> Dict[str, Stream]:
     """Parse the results from the scrapers into Torrent objects."""
     torrents: Set[Torrent] = set()
@@ -46,67 +55,94 @@ def _parse_results(item: MediaItem, results: Dict[str, str], log_msg: bool = Tru
     # we should remove keys from aliases if we are excluding the language
     aliases = {k: v for k, v in aliases.items() if k not in ranking_settings.languages.exclude}
 
-    logger.debug(f"Processing {len(results)} results for {item.log_string}")
+    min_rank = _get_min_rank_for_item(item)
 
-    for infohash, raw_title in results.items():
-        if infohash in processed_infohashes:
-            continue
+    # RTN's internal remove_ranks_under must be set to the lowest of the two
+    # per-type thresholds so it doesn't pre-filter torrents that our per-type
+    # logic should be deciding on.  We restore the original value afterwards.
+    ranking = settings_manager.settings.ranking
+    original_rtu = getattr(ranking.options, "remove_ranks_under", 0)
+    effective_rtu = min(ranking.min_rank_movie, ranking.min_rank_show)
+    if effective_rtu < original_rtu:
+        object.__setattr__(ranking.options, "remove_ranks_under", effective_rtu)
 
-        try:
-            torrent: Torrent = rtn.rank(
-                raw_title=raw_title,
-                infohash=infohash,
-                correct_title=correct_title,
-                remove_trash=settings_manager.settings.ranking.options["remove_all_trash"],
-                aliases=aliases
-            )
+    logger.debug(
+        f"Processing {len(results)} results for {item.log_string} "
+        f"(min_rank={min_rank}, rtn_remove_ranks_under={ranking.options.remove_ranks_under})"
+    )
 
-            if torrent.data.country and not item.is_anime:
-                # If country is present, then check to make sure it's correct. (Covers: US, UK, NZ, AU)
-                if _get_item_country(item) != torrent.data.country:
-                    if scraping_settings.parse_debug:
-                        logger.debug(f"Skipping torrent for incorrect country with {item.log_string}: {raw_title}")
-                    continue
-
-            if torrent.data.year and not _check_item_year(item, torrent.data):
-                # If year is present, then check to make sure it's correct
-                if scraping_settings.parse_debug:
-                    logger.debug(f"Skipping torrent for incorrect year with {item.log_string}: {raw_title}")
+    try:
+        for infohash, raw_title in results.items():
+            if infohash in processed_infohashes:
                 continue
 
-            if item.is_anime and scraping_settings.dubbed_anime_only:
-                # If anime and user wants dubbed only, then check to make sure it's dubbed
-                if not torrent.data.dubbed:
+            try:
+                torrent: Torrent = rtn.rank(
+                    raw_title=raw_title,
+                    infohash=infohash,
+                    correct_title=correct_title,
+                    remove_trash=settings_manager.settings.ranking.options.remove_all_trash,
+                    aliases=aliases
+                )
+
+                if torrent.rank < min_rank:
                     if scraping_settings.parse_debug:
-                        logger.debug(f"Skipping non-dubbed anime torrent for {item.log_string}: {raw_title}")
+                        logger.debug(
+                            f"Skipping torrent below min_rank ({torrent.rank} < {min_rank}) "
+                            f"for {item.log_string}: {raw_title}"
+                        )
+                    processed_infohashes.add(infohash)
                     continue
 
-            if item.type in ("show", "season"):
-                # if there are episodes, then check to make sure theres multiple
-                if torrent.data.episodes and not len(torrent.data.episodes) > 7:
+                if torrent.data.country and not item.is_anime:
+                    # If country is present, then check to make sure it's correct. (Covers: US, UK, NZ, AU)
+                    if _get_item_country(item) != torrent.data.country:
+                        if scraping_settings.parse_debug:
+                            logger.debug(f"Skipping torrent for incorrect country with {item.log_string}: {raw_title}")
+                        continue
+
+                if torrent.data.year and not _check_item_year(item, torrent.data):
+                    # If year is present, then check to make sure it's correct
                     if scraping_settings.parse_debug:
-                        logger.debug(f"Skipping torrent with too few episodes for {item.log_string}: {raw_title}")
+                        logger.debug(f"Skipping torrent for incorrect year with {item.log_string}: {raw_title}")
                     continue
 
-            if item.type == "show":
-                if not item.is_anime and len(item.seasons) > 1 and not len(torrent.data.seasons) > 1:
+                if item.is_anime and scraping_settings.dubbed_anime_only:
+                    # If anime and user wants dubbed only, then check to make sure it's dubbed
+                    if not torrent.data.dubbed:
+                        if scraping_settings.parse_debug:
+                            logger.debug(f"Skipping non-dubbed anime torrent for {item.log_string}: {raw_title}")
+                        continue
+
+                if item.type in ("show", "season"):
+                    # if there are episodes, then check to make sure theres multiple
+                    if torrent.data.episodes and not len(torrent.data.episodes) > 7:
+                        if scraping_settings.parse_debug:
+                            logger.debug(f"Skipping torrent with too few episodes for {item.log_string}: {raw_title}")
+                        continue
+
+                if item.type == "show":
+                    if not item.is_anime and len(item.seasons) > 1 and not len(torrent.data.seasons) > 1:
+                        if scraping_settings.parse_debug:
+                            logger.debug(f"Skipping torrent with too few seasons for {item.log_string}: {raw_title}")
+                        continue
+
+                # DV+HDR compatibility filter: If torrent has DV, it must also have HDR
+                if _has_dv_without_hdr(raw_title):
                     if scraping_settings.parse_debug:
-                        logger.debug(f"Skipping torrent with too few seasons for {item.log_string}: {raw_title}")
+                        logger.debug(f"Skipping DV-only torrent (no HDR) for {item.log_string}: {raw_title}")
                     continue
 
-            # DV+HDR compatibility filter: If torrent has DV, it must also have HDR
-            if _has_dv_without_hdr(raw_title):
-                if scraping_settings.parse_debug:
-                    logger.debug(f"Skipping DV-only torrent (no HDR) for {item.log_string}: {raw_title}")
+                torrents.add(torrent)
+                processed_infohashes.add(infohash)
+            except Exception as e:
+                if scraping_settings.parse_debug and log_msg:
+                    logger.debug(f"GarbageTorrent: {e}")
+                processed_infohashes.add(infohash)
                 continue
-
-            torrents.add(torrent)
-            processed_infohashes.add(infohash)
-        except Exception as e:
-            if scraping_settings.parse_debug and log_msg:
-                logger.debug(f"GarbageTorrent: {e}")
-            processed_infohashes.add(infohash)
-            continue
+    finally:
+        # Always restore original remove_ranks_under so other callers are unaffected
+        object.__setattr__(ranking.options, "remove_ranks_under", original_rtu)
 
     if torrents:
         logger.debug(f"Found {len(torrents)} streams for {item.log_string}")

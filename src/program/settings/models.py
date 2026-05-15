@@ -286,7 +286,36 @@ class ScraperModel(Observable):
 # Version Ranking Model (set application defaults here!)
 
 
-class RTNSettingsModel(SettingsModel, Observable): ...
+class RTNSettingsModel(SettingsModel, Observable):
+    """Extends RTN's SettingsModel with per-media-type rank thresholds.
+
+    The base SettingsModel already has options["remove_all_trash"] and the
+    global min_rank controlled by RTN.  These two fields let you set a
+    *lower* floor independently for movies vs shows/seasons/episodes so that,
+    for example, you can accept a wider range of episode quality without
+    relaxing the bar for movies.
+
+    Env-var overrides (via RIVEN_FORCE_ENV or on first boot):
+        RIVEN_RANKING_MIN_RANK_MOVIE=<int>
+        RIVEN_RANKING_MIN_RANK_SHOW=<int>
+    """
+
+    min_rank_movie: int = Field(
+        default=-10000,
+        description=(
+            "Remove movie streams with a rank below this value. "
+            "Defaults to -10000 (effectively no filter). "
+            "Set to 0 to match the legacy 'remove ranks under 0' behaviour."
+        ),
+    )
+    min_rank_show: int = Field(
+        default=-10000,
+        description=(
+            "Remove show/season/episode streams with a rank below this value. "
+            "Defaults to -10000 (effectively no filter). "
+            "Typically set lower than min_rank_movie to accept a wider range of episode quality."
+        ),
+    )
 
 
 # Application Settings

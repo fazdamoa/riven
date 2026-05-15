@@ -8,8 +8,9 @@ Key principles:
 4. Clean separation between cache checking and torrent addition
 """
 
+import time
 from datetime import datetime, timedelta
-from typing import Generator, List, Optional
+from typing import Dict, Generator, List, Optional
 
 from loguru import logger
 from sqlalchemy.orm import Session
@@ -34,6 +35,11 @@ from program.services.downloaders.torrent_download import TorrentDownload, Torre
 from .alldebrid import AllDebridDownloader
 from .realdebrid import RealDebridDownloader, RealDebridError, RealDebridErrorType
 from .torbox import TorBoxDownloader
+
+# In-memory rate limiting to prevent infinite loops
+_download_attempts: Dict[str, tuple] = {}  # item_id -> (attempt_count, last_attempt_time)
+_MAX_ATTEMPTS_PER_MINUTE = 3
+_HARD_COOLDOWN_MINUTES = 5
 
 
 class Downloader:
@@ -74,6 +80,41 @@ class Downloader:
         3. Add ONE torrent and track it
         4. Handle errors and move to next stream if needed
         """
+        # HARD RATE LIMIT - Prevent infinite loops at the source
+        global _download_attempts
+        item_id = str(item.id)
+        now = datetime.now()
+        
+        if item_id in _download_attempts:
+            attempt_count, first_attempt_time = _download_attempts[item_id]
+            time_since_first = (now - first_attempt_time).total_seconds()
+            
+            # Reset counter if more than a minute has passed
+            if time_since_first > 60:
+                _download_attempts[item_id] = (1, now)
+            elif attempt_count >= _MAX_ATTEMPTS_PER_MINUTE:
+                # Too many attempts - apply hard cooldown
+                cooldown_until = first_attempt_time + timedelta(minutes=_HARD_COOLDOWN_MINUTES)
+                if now < cooldown_until:
+                    remaining = (cooldown_until - now).total_seconds()
+                    # Only log once per cooldown period
+                    if attempt_count == _MAX_ATTEMPTS_PER_MINUTE:
+                        logger.warning(
+                            f"Rate limited {item.log_string}: {attempt_count} attempts in {time_since_first:.0f}s, "
+                            f"cooldown for {remaining:.0f}s"
+                        )
+                    _download_attempts[item_id] = (attempt_count + 1, first_attempt_time)
+                    # DON'T yield the item - this prevents state_transition from re-queuing it
+                    # The item will be picked up again on the next scheduler cycle
+                    return
+                else:
+                    # Cooldown expired, reset
+                    _download_attempts[item_id] = (1, now)
+            else:
+                _download_attempts[item_id] = (attempt_count + 1, first_attempt_time)
+        else:
+            _download_attempts[item_id] = (1, now)
+        
         logger.debug(f"Starting download process for {item.log_string} ({item.id})")
         
         # Skip if already completed
@@ -88,55 +129,170 @@ class Downloader:
             yield item
             return
         
-        with db.Session() as session:
-            # Step 1: Check for existing active download
-            active_download = TorrentDownload.get_active_for_item(session, item.id)
-            
-            if active_download:
-                # Process existing download
-                result = self._process_existing_download(session, item, active_download)
-                if result:
-                    # Download completed successfully
+        try:
+            with db.Session() as session:
+                # Step 0: Check for cooldown (all streams exhausted)
+                try:
+                    cooldown = session.query(TorrentDownload).filter(
+                        TorrentDownload.media_item_id == item.id,
+                        TorrentDownload.raw_title == "__NO_STREAMS_COOLDOWN__"
+                    ).first()
+                except Exception as e:
+                    # Table might not exist yet (migration not run)
+                    logger.debug(f"Could not query TorrentDownload table: {e}")
+                    cooldown = None
+                
+                if cooldown and cooldown.retry_after and cooldown.retry_after > datetime.now():
+                    remaining = (cooldown.retry_after - datetime.now()).total_seconds() / 60
+                    if remaining > 5:  # Only log if more than 5 minutes remaining
+                        logger.debug(
+                            f"Skipping {item.log_string}: in cooldown for {remaining:.0f} more minutes "
+                            f"(attempt {cooldown.attempt_count})"
+                        )
                     yield item
                     return
-                elif active_download.status == TorrentDownloadStatus.READY.value:
-                    # Ready but couldn't process - something's wrong
-                    logger.warning(f"Download ready but couldn't process for {item.log_string}")
-                    active_download.mark_failed("Could not process completed download")
+                
+                # Step 1: Check for existing active download
+                try:
+                    active_download = TorrentDownload.get_active_for_item(session, item.id)
+                except Exception as e:
+                    logger.debug(f"Could not check active downloads: {e}")
+                    active_download = None
+                
+                if active_download:
+                    # Process existing download
+                    result = self._process_existing_download(session, item, active_download)
+                    if result:
+                        # Download completed successfully
+                        yield item
+                        return
+                    elif active_download.status == TorrentDownloadStatus.READY.value:
+                        # Ready but couldn't process - something's wrong
+                        logger.warning(f"Download ready but couldn't process for {item.log_string}")
+                        active_download.mark_failed("Could not process completed download")
+                        session.commit()
+                    elif active_download.is_active:
+                        # Still downloading - yield and check again later
+                        logger.debug(f"Download still in progress for {item.log_string}")
+                        yield item
+                        return
+                
+                # Step 2: No active download, check for streams
+                if not item.streams:
+                    # No streams at all - apply cooldown to prevent loop
+                    logger.debug(f"No streams for {item.log_string}, applying cooldown")
+                    self._handle_no_available_streams(session, item, 0)
+                    yield item
+                    return
+                
+                # Get failed hashes to skip
+                try:
+                    failed_hashes = TorrentDownload.get_failed_hashes_for_item(session, item.id)
+                except Exception:
+                    failed_hashes = []
+                blacklisted_hashes = {s.infohash for s in item.blacklisted_streams}
+                skip_hashes = set(failed_hashes) | blacklisted_hashes
+                
+                # Find best available stream
+                best_stream = self._find_best_stream(item.streams, skip_hashes)
+                
+                if not best_stream:
+                    # All streams exhausted - apply backoff to prevent infinite loop
+                    logger.debug(f"All streams exhausted for {item.log_string}, applying cooldown")
+                    self._handle_no_available_streams(session, item, len(skip_hashes))
+                    yield item
+                    return
+                
+                # Found a stream! Clear any existing cooldown
+                if cooldown:
+                    session.delete(cooldown)
                     session.commit()
-                elif active_download.is_active:
-                    # Still downloading - yield and check again later
-                    logger.debug(f"Download still in progress for {item.log_string}")
-                    yield item
-                    return
+                
+                # Step 3: Try to download the best stream
+                result = self._start_download(session, item, best_stream)
+                session.commit()
+                
+                if result:
+                    logger.log("DEBRID", f"Download completed for {item.log_string}")
+                
+        except Exception as e:
+            logger.error(f"Error in download process for {item.log_string}: {e}")
+        
+        yield item
+
+    def _handle_no_available_streams(self, session: Session, item: MediaItem, failed_count: int):
+        """
+        Handle the case when all streams are failed/blacklisted.
+        Creates a cooldown record to prevent immediate retry loops.
+        """
+        # Check if there's already a cooldown record
+        existing_cooldown = session.query(TorrentDownload).filter(
+            TorrentDownload.media_item_id == item.id,
+            TorrentDownload.raw_title == "__NO_STREAMS_COOLDOWN__"
+        ).first()
+        
+        if existing_cooldown:
+            # Count how many times we've tried
+            attempt_count = existing_cooldown.attempt_count
             
-            # Step 2: No active download, find best stream
-            if not item.streams:
-                logger.debug(f"No streams available for {item.log_string}")
-                yield item
+            # Check if cooldown is still active
+            if existing_cooldown.retry_after and existing_cooldown.retry_after > datetime.now():
+                remaining = (existing_cooldown.retry_after - datetime.now()).total_seconds() / 60
+                logger.debug(
+                    f"No available streams for {item.log_string}, "
+                    f"cooldown active for {remaining:.1f} more minutes"
+                )
                 return
             
-            # Get failed hashes to skip
-            failed_hashes = TorrentDownload.get_failed_hashes_for_item(session, item.id)
-            blacklisted_hashes = {s.infohash for s in item.blacklisted_streams}
-            skip_hashes = set(failed_hashes) | blacklisted_hashes
+            # Cooldown expired, increment attempt count
+            attempt_count += 1
+            existing_cooldown.attempt_count = attempt_count
             
-            # Find best available stream
-            best_stream = self._find_best_stream(item.streams, skip_hashes)
-            
-            if not best_stream:
-                logger.debug(f"No available streams for {item.log_string} (all failed/blacklisted)")
-                yield item
+            # Check if we should give up entirely (after 10 attempts)
+            MAX_RETRIES = 10
+            if attempt_count >= MAX_RETRIES:
+                logger.warning(
+                    f"Giving up on {item.log_string} after {attempt_count} attempts "
+                    f"with no available streams ({failed_count} failed/blacklisted). "
+                    f"Remove from library or reset to try again."
+                )
+                # Set a very long cooldown (7 days)
+                existing_cooldown.retry_after = datetime.now() + timedelta(days=7)
+                existing_cooldown.error_message = f"All streams exhausted after {attempt_count} attempts"
+                session.commit()
                 return
             
-            # Step 3: Try to download the best stream
-            result = self._start_download(session, item, best_stream)
+            # Calculate exponential backoff: 2, 4, 8, 16, 32, 64, 128, 256, 512 minutes
+            backoff_minutes = min(2 ** attempt_count, 512)
+            existing_cooldown.retry_after = datetime.now() + timedelta(minutes=backoff_minutes)
+            existing_cooldown.error_message = f"No streams available (attempt {attempt_count})"
             session.commit()
             
-            if result:
-                logger.log("DEBRID", f"Download completed for {item.log_string}")
+            logger.debug(
+                f"No available streams for {item.log_string} "
+                f"(attempt {attempt_count}/{MAX_RETRIES}, {failed_count} failed/blacklisted, "
+                f"next retry in {backoff_minutes} minutes)"
+            )
+        else:
+            # First time hitting no streams - create cooldown record
+            cooldown = TorrentDownload(
+                media_item_id=item.id,
+                infohash="0" * 40,  # Dummy hash
+                raw_title="__NO_STREAMS_COOLDOWN__",
+                status=TorrentDownloadStatus.FAILED.value,
+                rank=0,
+                started_at=datetime.now(),
+                attempt_count=1,
+                retry_after=datetime.now() + timedelta(minutes=2),
+                error_message=f"No streams available ({failed_count} failed/blacklisted)"
+            )
+            session.add(cooldown)
+            session.commit()
             
-        yield item
+            logger.debug(
+                f"No available streams for {item.log_string} "
+                f"({failed_count} failed/blacklisted, next retry in 2 minutes)"
+            )
 
     def _process_existing_download(
         self, 
@@ -212,12 +368,14 @@ class Downloader:
                 
         except RealDebridError as e:
             if e.error_type == RealDebridErrorType.NOT_FOUND:
-                # Torrent was deleted from RD
-                logger.warning(f"Torrent not found in RD for {item.log_string}")
-                download.mark_failed("Torrent removed from Real-Debrid")
+                # Torrent was deleted from RD - treat as skipped so the infohash
+                # is added to failed_hashes and the next stream is tried promptly
+                logger.warning(f"Torrent not found in RD for {item.log_string}, marking as skipped")
+                download.mark_skipped("Torrent removed from Real-Debrid")
             else:
                 logger.error(f"Error checking torrent status: {e}")
                 download.mark_failed(str(e))
+            session.commit()
             return False
 
     def _find_best_stream(self, streams: List[Stream], skip_hashes: set) -> Optional[Stream]:
@@ -241,9 +399,12 @@ class Downloader:
         Start a new download for a stream.
         
         Flow:
-        1. Check if cached first (no torrent addition)
-        2. If cached: Add to RD and process immediately
-        3. If not cached: Add to RD and track for later
+        1. Create and immediately flush a PENDING tracking record so concurrent
+           calls to get_active_for_item() see it before any API work begins.
+        2. Add the torrent to RD.
+        3. Handle file selection if needed.
+        4. If RD reports it cached/downloaded, process immediately.
+           Otherwise mark as downloading and let check_active_downloads poll.
         
         Returns:
             True if completed immediately (cached), False if downloading/failed
@@ -251,7 +412,9 @@ class Downloader:
         infohash = stream.infohash
         logger.log("DEBRID", f"Attempting download: {stream.raw_title} [{infohash[:8]}...] (rank: {stream.rank})")
         
-        # Create tracking record
+        # Create and flush tracking record immediately so that any concurrent
+        # invocation of run() for the same item sees an active download and
+        # exits early, rather than racing into _start_download again.
         download = TorrentDownload.create_for_item(
             session=session,
             media_item_id=item.id,
@@ -259,33 +422,11 @@ class Downloader:
             raw_title=stream.raw_title,
             rank=stream.rank
         )
+        session.flush()  # persist to DB within this transaction immediately
         
         try:
-            # Step 1: Check if already exists in RD
-            existing = self.service.find_existing_torrent(infohash)
-            
-            if existing:
-                torrent_id, status = existing
-                download.torrent_id = torrent_id
-                
-                if status.is_cached:
-                    # Already cached! Process immediately
-                    return self._process_cached_torrent(session, item, download, torrent_id)
-                
-                elif status.is_downloading:
-                    # Already downloading - just track it
-                    download.mark_downloading(torrent_id)
-                    logger.log("DEBRID", f"Already downloading in RD: {stream.raw_title}")
-                    return False
-                
-                elif status.is_error:
-                    # Existing torrent is in error state - try fresh add
-                    logger.debug(f"Existing torrent in error state, will add fresh")
-            
-            # Step 2: Check cache before adding (for new torrents)
-            is_cached = self.service.check_cache(infohash)
-            
-            # Step 3: Add torrent to RD
+            # Add torrent to RD — RD deduplicates by hash, so if it already
+            # exists in the account we just get back the existing torrent ID.
             torrent_id, status = self.service.add_torrent(infohash)
             download.torrent_id = torrent_id
             
@@ -298,10 +439,9 @@ class Downloader:
             
             # Check final status
             if status.is_cached:
-                # Instantly cached! Process immediately
                 return self._process_cached_torrent(session, item, download, torrent_id)
             else:
-                # Not cached - mark as downloading
+                # Queued or actively downloading — come back later via check_active_downloads
                 download.mark_downloading(torrent_id)
                 logger.log("DEBRID", f"Started download (not cached): {stream.raw_title}")
                 return False

@@ -159,6 +159,7 @@ class Program(threading.Thread):
             logger.success("Database created successfully")
 
         run_migrations()
+        self._cleanup_stale_downloads_on_startup()
         self._init_db_from_symlinks()
 
         with db.Session() as session:
@@ -186,6 +187,126 @@ class Program(threading.Thread):
         self.scheduler.start()
         logger.success("Riven is running!")
         self.initialized = True
+
+    def _cleanup_stale_downloads_on_startup(self) -> None:
+        """
+        Clean up stale TorrentDownload state left over from a previous session.
+
+        On every restart we:
+        1. Delete PENDING/DOWNLOADING records — their RD torrent IDs are
+           unreliable (could have been cleaned up by RD, or just abandoned).
+           These items still have streams and will be retried normally.
+        2. Delete __NO_STREAMS_COOLDOWN__ sentinel records — cooldowns should
+           not survive a restart; a fresh scrape may have found new streams.
+        3. For items whose every non-blacklisted stream hash now appears in a
+           FAILED/SKIPPED TorrentDownload record, wipe their streams entirely
+           so state_transition sends them back to Scraping rather than looping
+           through Downloader forever.
+        """
+        from program.services.downloaders.torrent_download import TorrentDownload, TorrentDownloadStatus
+        from program.media.item import MediaItem
+        from program.media.stream import Stream, StreamRelation, StreamBlacklistRelation
+        from sqlalchemy import delete
+
+        with db.Session() as session:
+            # 1. Drop active (non-terminal) download records — they are stale.
+            stale_statuses = [
+                TorrentDownloadStatus.PENDING.value,
+                TorrentDownloadStatus.DOWNLOADING.value,
+                TorrentDownloadStatus.READY.value,
+            ]
+            stale_count = session.query(TorrentDownload).filter(
+                TorrentDownload.status.in_(stale_statuses)
+            ).count()
+            if stale_count:
+                session.query(TorrentDownload).filter(
+                    TorrentDownload.status.in_(stale_statuses)
+                ).delete(synchronize_session=False)
+                logger.info(f"Startup cleanup: removed {stale_count} stale active download record(s).")
+
+            # 2. Drop no-streams cooldown sentinels so items are retried fresh.
+            cooldown_count = session.query(TorrentDownload).filter(
+                TorrentDownload.raw_title == "__NO_STREAMS_COOLDOWN__"
+            ).count()
+            if cooldown_count:
+                session.query(TorrentDownload).filter(
+                    TorrentDownload.raw_title == "__NO_STREAMS_COOLDOWN__"
+                ).delete(synchronize_session=False)
+                logger.info(f"Startup cleanup: removed {cooldown_count} no-streams cooldown record(s).")
+
+            session.commit()
+
+            # 3. Find items in Scraped state where all available stream hashes
+            #    are exhausted (every hash is FAILED/SKIPPED in TorrentDownload).
+            #    Reset their streams so they go back to Scraping.
+            exhausted_statuses = [
+                TorrentDownloadStatus.FAILED.value,
+                TorrentDownloadStatus.SKIPPED.value,
+                TorrentDownloadStatus.LEGAL_ERROR.value,
+            ]
+            scraped_items = session.execute(
+                select(MediaItem)
+                .where(MediaItem.last_state == States.Scraped)
+                .where(MediaItem.type.in_(["movie", "episode", "season"]))
+            ).unique().scalars().all()
+
+            streams_reset_count = 0
+            for item in scraped_items:
+                # Get non-blacklisted stream infohashes for this item via joins
+                blacklisted_hashes = {
+                    row[0] for row in
+                    session.query(Stream.infohash)
+                    .join(StreamBlacklistRelation, StreamBlacklistRelation.stream_id == Stream.id)
+                    .filter(StreamBlacklistRelation.media_item_id == item.id)
+                    .all()
+                }
+                available_hashes = [
+                    row[0] for row in
+                    session.query(Stream.infohash)
+                    .join(StreamRelation, StreamRelation.child_id == Stream.id)
+                    .filter(StreamRelation.parent_id == item.id)
+                    .all()
+                    if row[0] not in blacklisted_hashes
+                ]
+
+                if not available_hashes:
+                    continue
+
+                failed_hashes = {
+                    row[0] for row in
+                    session.query(TorrentDownload.infohash)
+                    .filter(
+                        TorrentDownload.media_item_id == item.id,
+                        TorrentDownload.status.in_(exhausted_statuses),
+                    )
+                    .all()
+                }
+
+                if all(h in failed_hashes for h in available_hashes):
+                    # Every stream is exhausted — wipe streams so Scraping re-runs.
+                    session.execute(
+                        delete(StreamRelation).where(StreamRelation.parent_id == item.id)
+                    )
+                    session.execute(
+                        delete(StreamBlacklistRelation)
+                        .where(StreamBlacklistRelation.media_item_id == item.id)
+                    )
+                    # Also remove those TorrentDownload failure records so the
+                    # fresh scrape result can be attempted with a clean slate.
+                    session.query(TorrentDownload).filter(
+                        TorrentDownload.media_item_id == item.id,
+                        TorrentDownload.status.in_(exhausted_statuses),
+                    ).delete(synchronize_session=False)
+                    streams_reset_count += 1
+
+            if streams_reset_count:
+                session.commit()
+                logger.info(
+                    f"Startup cleanup: reset streams for {streams_reset_count} item(s) "
+                    f"with all streams exhausted — they will be re-scraped."
+                )
+
+        logger.debug("Startup cleanup complete.")
 
     def _retry_library(self) -> None:
         """Retry items that failed to download."""

@@ -8,7 +8,7 @@ from loguru import logger
 from requests import ConnectTimeout, ReadTimeout
 from requests.exceptions import RequestException
 
-from program.media.item import MediaItem, Show
+from program.media.item import MediaItem
 from program.services.scrapers.shared import (
     ScraperRequestHandler,
     _get_stremio_identifier,
@@ -29,28 +29,7 @@ class Comet:
         self.key = "comet"
         self.settings = settings_manager.settings.scraping.comet
         self.timeout = self.settings.timeout or 15
-        self.encoded_string = base64.b64encode(json.dumps({
-            "maxResultsPerResolution": 0,
-            "maxSize": 0,
-            "cachedOnly": False,
-            "removeTrash": True,
-            "resultFormat": [
-                "title",
-                "metadata",
-                "size",
-                "languages"
-            ],
-            "debridService": "torrent",
-            "debridApiKey": "",
-            "debridStreamProxyPassword": "",
-            "languages": {
-                "required": [],
-                "exclude": [],
-                "preferred": []
-            },
-            "resolutions": {},
-            "options": {}
-        }).encode("utf-8")).decode("utf-8")
+        
         rate_limit_params = get_rate_limit_params(per_hour=300) if self.settings.ratelimit else None
         session = create_service_session(rate_limit_params=rate_limit_params)
         self.request_handler = ScraperRequestHandler(session)
@@ -81,6 +60,70 @@ class Comet:
             logger.error(f"Comet failed to initialize: {e}", )
         return False
 
+    def get_encoded_config(self) -> str:
+        """Generate the base64 encoded config string for Comet."""
+        debrid_services = []
+        
+        # Real-Debrid
+        rd_settings = settings_manager.settings.downloaders.real_debrid
+        if rd_settings.enabled and rd_settings.api_key:
+            debrid_services.append({
+                "service": "realdebrid",
+                "apiKey": rd_settings.api_key
+            })
+            
+        # All-Debrid
+        ad_settings = settings_manager.settings.downloaders.all_debrid
+        if ad_settings.enabled and ad_settings.api_key:
+            debrid_services.append({
+                "service": "alldebrid",
+                "apiKey": ad_settings.api_key
+            })
+            
+        # TorBox
+        tb_settings = settings_manager.settings.downloaders.torbox
+        if tb_settings.enabled and tb_settings.api_key:
+            debrid_services.append({
+                "service": "torbox",
+                "apiKey": tb_settings.api_key
+            })
+
+        config = {
+            "maxResultsPerResolution": 100,
+            "maxSize": 0,
+            "cachedOnly": False,
+            "sortCachedUncachedTogether": False,
+            "removeTrash": True,
+            "resultFormat": ["all"],
+            "debridServices": debrid_services,
+            "enableTorrent": False,
+            "deduplicateStreams": False,
+            "scrapeDebridAccountTorrents": False,
+            "debridStreamProxyPassword": "",
+            "languages": {
+                "required": ["en"],
+                "allowed": [],
+                "exclude": [],
+                "preferred": []
+            },
+            "resolutions": {
+                "r2160p": True,
+                "r1080p": True,
+                "r720p": True,
+                "r576p": False,
+                "r480p": False,
+                "r360p": False,
+                "r240p": False,
+                "unknown": False
+            },
+            "options": {
+                "remove_ranks_under": 0,
+                "allow_english_in_languages": False,
+                "remove_unknown_languages": False
+            }
+        }
+        return base64.b64encode(json.dumps(config).encode("utf-8")).decode("utf-8")
+
     def run(self, item: MediaItem) -> Dict[str, str]:
         """Scrape the comet site for the given media items
         and update the object with scraped streams"""
@@ -98,21 +141,34 @@ class Comet:
             logger.error(f"Comet exception thrown: {str(e)}")
         return {}
 
-    def scrape(self, item: MediaItem) -> tuple[Dict[str, str], int]:
+    def scrape(self, item: MediaItem) -> Dict[str, str]:
         """Wrapper for `Comet` scrape method"""
         identifier, scrape_type, imdb_id = _get_stremio_identifier(item)
-        url = f"{self.settings.url}/{self.encoded_string}/stream/{scrape_type}/{imdb_id}{identifier or ''}.json"
+        encoded_config = self.get_encoded_config()
+        url = f"{self.settings.url}/{encoded_config}/stream/{scrape_type}/{imdb_id}{identifier or ''}.json"
 
         response = self.request_handler.execute(HttpMethod.GET, url, timeout=self.timeout)
-        if not response.is_ok or not getattr(response.data, "streams", None):
+        if not response.is_ok or not hasattr(response.data, "streams") or not response.data.streams:
             logger.log("NOT_FOUND", f"No streams found for {item.log_string}")
             return {}
 
-        torrents = {
-            stream.infoHash: stream.description.split("\n")[0] 
-            for stream in response.data.streams if hasattr(stream, "infoHash")
-            and stream.infoHash
-        }
+        torrents: Dict[str, str] = {}
+        for stream in response.data.streams:
+            info_hash = getattr(stream, "infoHash", None)
+            if not info_hash:
+                # Try to extract from URL if infoHash is missing (common in modern Comet)
+                stream_url = getattr(stream, "url", "")
+                match = regex.search(r"/playback/([a-fA-F0-9]{40})", stream_url)
+                if match:
+                    info_hash = match.group(1)
+            
+            if not info_hash:
+                continue
+
+            description = getattr(stream, "description", "")
+            # Title is the first line, strip the document emoji if present
+            raw_title = description.split("\n")[0].replace("📄 ", "").strip()
+            torrents[info_hash] = raw_title
 
         if torrents:
             logger.log("SCRAPER", f"Found {len(torrents)} streams for {item.log_string}")

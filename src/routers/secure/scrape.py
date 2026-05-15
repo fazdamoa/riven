@@ -21,6 +21,7 @@ from program.services.scrapers import Scraping
 from program.services.scrapers.shared import rtn
 from program.types import Event
 from program.services.downloaders.models import TorrentContainer, TorrentInfo, DebridFile
+from program.services.downloaders.realdebrid import RealDebridError, RealDebridErrorType
 
 
 class Stream(BaseModel):
@@ -280,18 +281,145 @@ async def start_manual_session(
     if not item:
         raise HTTPException(status_code=404, detail="Item not found")
 
-    container = downloader.get_instant_availability(info_hash, item.type)
+    logger.debug(f"[ManualScrape] Starting session for item={item.log_string}, infohash={info_hash[:16]}...")
 
-    if not container or not container.cached:
-        raise HTTPException(status_code=400, detail="Torrent is not cached, please try another stream")
+    # Step 1: Check if torrent already exists in the user's debrid account
+    existing_torrent = None
+    torrent_id = None
+    container = None
+    service = downloader.service  # Get the underlying service (RealDebridDownloader, etc.)
+    
+    if hasattr(service, 'find_existing_torrent'):
+        logger.debug(f"[ManualScrape] Step 1: Checking if torrent already exists in debrid account...")
+        existing_torrent = service.find_existing_torrent(info_hash)
+    
+    if existing_torrent:
+        torrent_id, status = existing_torrent
+        logger.info(f"[ManualScrape] Found existing torrent in debrid: id={torrent_id}, status={status.status}, is_cached={status.is_cached}")
+        
+        if status.is_cached:
+            logger.debug(f"[ManualScrape] Torrent is already cached, processing...")
+            container = service.process_completed_torrent(torrent_id, info_hash, item.type)
+        elif status.needs_file_selection:
+            logger.debug(f"[ManualScrape] Torrent needs file selection, selecting files...")
+            service.select_video_files(torrent_id)
+            # Re-check status after file selection
+            status = service.get_torrent_status(torrent_id)
+            if status.is_cached:
+                container = service.process_completed_torrent(torrent_id, info_hash, item.type)
+        else:
+            logger.warning(f"[ManualScrape] Existing torrent has status={status.status}, not usable")
+    
+    # Step 2: If not found or not usable, add the torrent to RD
+    # RD will instantly complete it if it's cached on their servers
+    if not container:
+        logger.debug(f"[ManualScrape] Step 2: Adding torrent to debrid (will be instant if cached)...")
+        try:
+            import time
+            
+            # Use the underlying service directly to get both torrent_id and status
+            add_result = service.add_torrent(info_hash)
+            
+            # Handle different return types (tuple vs string)
+            if isinstance(add_result, tuple):
+                torrent_id, status = add_result
+            else:
+                torrent_id = add_result
+                status = service.get_torrent_status(torrent_id)
+            
+            logger.info(f"[ManualScrape] Added torrent: id={torrent_id}, status={status.status}")
+            
+            # Handle file selection if needed
+            if status.needs_file_selection:
+                logger.debug(f"[ManualScrape] Torrent needs file selection...")
+                logger.debug(f"[ManualScrape] Available files: {list(status.files.keys()) if status.files else 'None'}")
+                
+                # Select all files directly
+                try:
+                    from program.utils.request import HttpMethod
+                    service.api.request_handler.execute(
+                        HttpMethod.POST,
+                        f"torrents/selectFiles/{torrent_id}",
+                        data={"files": "all"}
+                    )
+                    logger.debug(f"[ManualScrape] Selected all files")
+                except Exception as select_err:
+                    logger.error(f"[ManualScrape] File selection failed: {select_err}")
+                
+                # Wait for RD to process
+                time.sleep(2)
+                
+                # Re-check status
+                status = service.get_torrent_status(torrent_id)
+                logger.debug(f"[ManualScrape] Status after file selection: {status.status}")
+            
+            # Poll for completion (cached torrents should complete quickly)
+            max_wait = 10  # seconds
+            wait_interval = 1
+            waited = 0
+            
+            while not status.is_cached and not status.is_error and waited < max_wait:
+                if status.status == "downloading" and status.progress == 0:
+                    # Actually downloading from scratch - not cached
+                    break
+                logger.debug(f"[ManualScrape] Waiting for torrent... status={status.status}, progress={status.progress}")
+                time.sleep(wait_interval)
+                waited += wait_interval
+                status = service.get_torrent_status(torrent_id)
+            
+            logger.info(f"[ManualScrape] Final status: {status.status}, is_cached={status.is_cached}")
+            
+            # Check final status
+            if status.is_cached:
+                logger.debug(f"[ManualScrape] Torrent is cached on RD, processing...")
+                container = service.process_completed_torrent(torrent_id, info_hash, item.type)
+                if container:
+                    logger.debug(f"[ManualScrape] Got container with {len(container.files)} files")
+                else:
+                    logger.warning(f"[ManualScrape] process_completed_torrent returned None - checking files...")
+                    # Debug: let's see what files are available
+                    final_status = service.get_torrent_status(torrent_id)
+                    logger.debug(f"[ManualScrape] Files in torrent: {final_status.files}")
+            elif status.is_downloading or status.status == "queued":
+                logger.warning(f"[ManualScrape] Torrent is NOT cached (status={status.status}, progress={status.progress}%)")
+                service.delete_torrent(torrent_id)
+                raise HTTPException(
+                    status_code=400, 
+                    detail=f"Torrent is not cached on Real-Debrid (would need to download). Status: {status.status}"
+                )
+            elif status.is_error:
+                logger.error(f"[ManualScrape] Torrent has error status: {status.status}")
+                service.delete_torrent(torrent_id)
+                raise HTTPException(status_code=400, detail=f"Torrent error: {status.status}")
+            else:
+                logger.warning(f"[ManualScrape] Unexpected final status: {status.status}")
+                
+        except RealDebridError as e:
+            logger.error(f"[ManualScrape] Failed to add torrent: {e.message} (type={e.error_type})")
+            if e.error_type == RealDebridErrorType.LEGAL_BLOCKED:
+                raise HTTPException(status_code=400, detail="Torrent is blocked for legal reasons (DMCA)")
+            raise HTTPException(status_code=400, detail=f"Failed to add torrent: {e.message}")
+        except HTTPException:
+            raise  # Re-raise HTTP exceptions from the inner logic
 
+    if not container:
+        logger.warning(f"[ManualScrape] Failed to get container after all attempts")
+        raise HTTPException(
+            status_code=400, 
+            detail="Could not process torrent. It may not be cached or has no valid video files."
+        )
+    
+    logger.info(f"[ManualScrape] Success! Container has {len(container.files)} files, creating session...")
     session = session_manager.create_session(item_id or imdb_id, info_hash)
 
     try:
-        torrent_id: str = downloader.add_torrent(info_hash)
+        # We already have torrent_id from the add/find operation above
         torrent_info: TorrentInfo = downloader.get_torrent_info(torrent_id)
+        logger.debug(f"[ManualScrape] Got torrent_info: name={torrent_info.name}, status={torrent_info.status}")
         session_manager.update_session(session.id, torrent_id=torrent_id, torrent_info=torrent_info, containers=container)
+        logger.info(f"[ManualScrape] Session {session.id} created successfully")
     except Exception as e:
+        logger.error(f"[ManualScrape] Failed to create session: {e}")
         background_tasks.add_task(session_manager.abort_session, session.id)
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -341,26 +469,49 @@ def manual_select_files(request: Request, session_id: str, files: Container) -> 
     operation_id="manual_update_attributes"
 )
 async def manual_update_attributes(request: Request, session_id, data: Union[DebridFile, ShowFileData]) -> UpdateAttributesResponse:
+    logger.debug(f"[ManualScrape] update_attributes called with session_id={session_id}")
+    logger.debug(f"[ManualScrape] Current sessions: {list(session_manager.sessions.keys())}")
+    
     session = session_manager.get_session(session_id)
     log_string = None
     if not session:
+        logger.error(f"[ManualScrape] Session {session_id} not found! Available: {list(session_manager.sessions.keys())}")
         raise HTTPException(status_code=404, detail="Session not found or expired")
     if not session.item_id:
         session_manager.abort_session(session_id)
         raise HTTPException(status_code=500, detail="No item ID found")
 
+    logger.debug(f"[ManualScrape] update_attributes processing for item_id={session.item_id}")
+
     with db.Session() as db_session:
-        if str(session.item_id).startswith("tt") and not db_functions.get_item_by_external_id(imdb_id=session.item_id) and not db_functions.get_item_by_id(session.item_id):
-            prepared_item = MediaItem({"imdb_id": session.item_id})
-            item = next(TraktIndexer().run(prepared_item))
+        item = None
+        
+        # Try to find the item
+        if str(session.item_id).startswith("tt"):
+            # It's an IMDb ID
+            logger.debug(f"[ManualScrape] Looking up by IMDb ID: {session.item_id}")
+            item = db_functions.get_item_by_external_id(imdb_id=session.item_id)
+            logger.debug(f"[ManualScrape] get_item_by_external_id result: {item}")
+            
             if not item:
-                raise HTTPException(status_code=404, detail="Unable to index item")
-            db_session.merge(item)
-            db_session.commit()
+                # Item not in DB yet, need to index it
+                logger.debug(f"[ManualScrape] Item not found, indexing from Trakt...")
+                prepared_item = MediaItem({"imdb_id": session.item_id})
+                item = next(TraktIndexer().run(prepared_item))
+                if not item:
+                    raise HTTPException(status_code=404, detail="Unable to index item")
+                logger.debug(f"[ManualScrape] Indexed item: {item.log_string}, saving to DB...")
+                db_session.add(item)
+                db_session.commit()
+                db_session.refresh(item)
+                logger.debug(f"[ManualScrape] Item saved with ID: {item.id}")
         else:
-          item = db_functions.get_item_by_id(session.item_id)
+            # It's a database ID
+            logger.debug(f"[ManualScrape] Looking up by DB ID: {session.item_id}")
+            item = db_functions.get_item_by_id(session.item_id)
 
         if not item:
+            logger.error(f"[ManualScrape] Item not found after all lookup attempts")
             raise HTTPException(status_code=404, detail="Item not found")
 
         item = db_session.merge(item)
@@ -381,13 +532,27 @@ async def manual_update_attributes(request: Request, session_id, data: Union[Deb
             update_item(item, data, session)
 
         else:
+            logger.debug(f"[ManualScrape] Processing show data: {data}")
+            logger.debug(f"[ManualScrape] Show has seasons: {[s.number for s in item.seasons] if hasattr(item, 'seasons') else 'N/A'}")
+            
             for season_number, episodes in data.root.items():
+                logger.debug(f"[ManualScrape] Processing season {season_number}, episodes: {list(episodes.keys())}")
+                
                 for episode_number, episode_data in episodes.items():
+                    logger.debug(f"[ManualScrape] Looking for S{season_number:02d}E{episode_number:02d}")
+                    
                     if item.type == "show":
-                        if (episode := item.get_episode(episode_number, season_number)):
+                        episode = item.get_episode(episode_number, season_number)
+                        if episode:
+                            logger.debug(f"[ManualScrape] Found episode: {episode.log_string}")
                             update_item(episode, episode_data, session)
                         else:
-                            logger.error(f"Failed to find episode {episode_number} for season {season_number} for {item.log_string}")
+                            logger.error(f"[ManualScrape] Failed to find episode {episode_number} for season {season_number} for {item.log_string}")
+                            # List available seasons/episodes for debugging
+                            if hasattr(item, 'seasons'):
+                                for s in item.seasons:
+                                    eps = [e.number for e in s.episodes] if hasattr(s, 'episodes') else []
+                                    logger.debug(f"[ManualScrape] Available: Season {s.number} has episodes: {eps}")
                             continue
                     elif item.type == "season":
                         if (episode := item.parent.get_episode(episode_number, season_number)):

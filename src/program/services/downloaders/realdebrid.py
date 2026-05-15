@@ -257,11 +257,11 @@ class RealDebridDownloader(DownloaderBase):
             RealDebridError with appropriate error_type
         """
         try:
-            magnet = f"magnet:?xt=urn:btih:{infohash}"
+            magnet = f"magnet:?xt=urn:btih:{infohash.lower()}"
             response = self.api.request_handler.execute(
                 HttpMethod.POST,
                 "torrents/addMagnet",
-                data={"magnet": magnet.lower()}
+                data={"magnet": magnet}
             )
             
             torrent_id = response["id"]

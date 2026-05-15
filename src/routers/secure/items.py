@@ -326,7 +326,12 @@ async def retry_items(request: Request, ids: str) -> RetryResponse:
             if item:
                 with db.Session() as session:
                     item.scraped_at = None
-                    item.scraped_times = 1
+                    item.scraped_times = 0
+                    item.failed_attempts = 0
+                    if item.indexed_at:
+                        item.last_state = States.Indexed
+                    else:
+                        item.last_state = States.Requested
                     session.merge(item)
                     session.commit()
                 request.app.program.em.add_event(Event("RetryItem", id))
