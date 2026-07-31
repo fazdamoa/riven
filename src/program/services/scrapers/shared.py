@@ -5,6 +5,7 @@ from typing import Dict, Optional, Set, Type
 
 from loguru import logger
 from RTN import RTN, ParsedData, Torrent, sort_torrents
+from RTN.models import SettingsModel
 
 from program.media.item import Episode, MediaItem, Movie, Season, Show
 from program.media.stream import Stream
@@ -28,6 +29,29 @@ ranking_model = models.get(profile_name)
 rtn = RTN(ranking_settings, ranking_model)
 
 
+def _create_manual_rtn() -> RTN:
+    """Build a permissive RTN instance used only for manual scraping.
+
+    Same ranking profile as the strict instance, but with every resolution
+    enabled and the rank floor disabled. This lets low resolution releases
+    (often the only copies of older shows) appear in manual scrape results
+    for the user to pick from. Automatic scraping keeps using the strict
+    instance, so low-res streams are never added to items or auto-downloaded.
+    """
+    # Only pass fields the base SettingsModel knows about (RTNSettingsModel
+    # adds min_rank_movie/min_rank_show, which would be rejected as extras).
+    base_fields = set(SettingsModel.model_fields)
+    base_data = {k: v for k, v in ranking_settings.model_dump().items() if k in base_fields}
+    permissive_settings = SettingsModel(**base_data)
+    for resolution_field in type(permissive_settings.resolutions).model_fields:
+        object.__setattr__(permissive_settings.resolutions, resolution_field, True)
+    object.__setattr__(permissive_settings.options, "remove_ranks_under", -10_000_000)
+    return RTN(permissive_settings, ranking_model)
+
+
+manual_rtn = _create_manual_rtn()
+
+
 class ScraperRequestHandler(BaseRequestHandler):
     def __init__(self, session: Session, response_type=ResponseType.SIMPLE_NAMESPACE, custom_exception: Optional[Type[Exception]] = None, request_logging: bool = False):
         super().__init__(session, response_type=response_type, custom_exception=custom_exception, request_logging=request_logging)
@@ -45,8 +69,14 @@ def _get_min_rank_for_item(item: MediaItem) -> int:
     return ranking.min_rank_show
 
 
-def _parse_results(item: MediaItem, results: Dict[str, str], log_msg: bool = True) -> Dict[str, Stream]:
-    """Parse the results from the scrapers into Torrent objects."""
+def _parse_results(item: MediaItem, results: Dict[str, str], log_msg: bool = True, manual: bool = False) -> Dict[str, Stream]:
+    """Parse the results from the scrapers into Torrent objects.
+
+    When `manual` is True (manual scrape from the UI), a permissive ranker is
+    used and the per-type min_rank filter is skipped, so low resolution
+    releases are listed for the user to choose instead of being binned.
+    """
+    ranker: RTN = manual_rtn if manual else rtn
     torrents: Set[Torrent] = set()
     processed_infohashes: Set[str] = set()
     correct_title: str = item.get_top_title()
@@ -55,16 +85,18 @@ def _parse_results(item: MediaItem, results: Dict[str, str], log_msg: bool = Tru
     # we should remove keys from aliases if we are excluding the language
     aliases = {k: v for k, v in aliases.items() if k not in ranking_settings.languages.exclude}
 
-    min_rank = _get_min_rank_for_item(item)
+    min_rank = None if manual else _get_min_rank_for_item(item)
 
     # RTN's internal remove_ranks_under must be set to the lowest of the two
     # per-type thresholds so it doesn't pre-filter torrents that our per-type
     # logic should be deciding on.  We restore the original value afterwards.
+    # (Skipped in manual mode: manual_rtn carries its own permissive settings.)
     ranking = settings_manager.settings.ranking
     original_rtu = getattr(ranking.options, "remove_ranks_under", 0)
-    effective_rtu = min(ranking.min_rank_movie, ranking.min_rank_show)
-    if effective_rtu < original_rtu:
-        object.__setattr__(ranking.options, "remove_ranks_under", effective_rtu)
+    if not manual:
+        effective_rtu = min(ranking.min_rank_movie, ranking.min_rank_show)
+        if effective_rtu < original_rtu:
+            object.__setattr__(ranking.options, "remove_ranks_under", effective_rtu)
 
     logger.debug(
         f"Processing {len(results)} results for {item.log_string} "
@@ -77,7 +109,7 @@ def _parse_results(item: MediaItem, results: Dict[str, str], log_msg: bool = Tru
                 continue
 
             try:
-                torrent: Torrent = rtn.rank(
+                torrent: Torrent = ranker.rank(
                     raw_title=raw_title,
                     infohash=infohash,
                     correct_title=correct_title,
@@ -85,7 +117,7 @@ def _parse_results(item: MediaItem, results: Dict[str, str], log_msg: bool = Tru
                     aliases=aliases
                 )
 
-                if torrent.rank < min_rank:
+                if min_rank is not None and torrent.rank < min_rank:
                     if scraping_settings.parse_debug:
                         logger.debug(
                             f"Skipping torrent below min_rank ({torrent.rank} < {min_rank}) "

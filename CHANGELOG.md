@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Features
+
+* TorBox downloader refactored to single-torrent contract; native rclone+TorBox WebDAV deployment supported.
+
 ## [0.23.5](https://github.com/rivenmedia/riven/compare/v0.23.4...v0.23.5) (2025-08-20)
 
 

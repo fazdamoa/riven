@@ -34,7 +34,7 @@ from program.services.downloaders.torrent_download import TorrentDownload, Torre
 
 from .alldebrid import AllDebridDownloader
 from .realdebrid import RealDebridDownloader, RealDebridError, RealDebridErrorType
-from .torbox import TorBoxDownloader
+from .torbox import TorBoxDownloader, TorBoxError, TorBoxErrorType
 
 # In-memory rate limiting to prevent infinite loops
 _download_attempts: Dict[str, tuple] = {}  # item_id -> (attempt_count, last_attempt_time)
@@ -366,12 +366,15 @@ class Downloader:
                 logger.debug(f"Unknown torrent status for {item.log_string}: {status.status}")
                 return False
                 
-        except RealDebridError as e:
-            if e.error_type == RealDebridErrorType.NOT_FOUND:
-                # Torrent was deleted from RD - treat as skipped so the infohash
-                # is added to failed_hashes and the next stream is tried promptly
-                logger.warning(f"Torrent not found in RD for {item.log_string}, marking as skipped")
-                download.mark_skipped("Torrent removed from Real-Debrid")
+        except (RealDebridError, TorBoxError) as e:
+            # Treat NOT_FOUND as a skip so the next stream is tried
+            is_not_found = (
+                (isinstance(e, RealDebridError) and e.error_type == RealDebridErrorType.NOT_FOUND)
+                or (isinstance(e, TorBoxError) and e.error_type == TorBoxErrorType.NOT_FOUND)
+            )
+            if is_not_found:
+                logger.warning(f"Torrent not found in debrid account for {item.log_string}, marking as skipped")
+                download.mark_skipped("Torrent removed from debrid account")
             else:
                 logger.error(f"Error checking torrent status: {e}")
                 download.mark_failed(str(e))
@@ -446,7 +449,7 @@ class Downloader:
                 logger.log("DEBRID", f"Started download (not cached): {stream.raw_title}")
                 return False
                 
-        except RealDebridError as e:
+        except (RealDebridError, TorBoxError) as e:
             self._handle_download_error(download, e, stream)
             return False
         except Exception as e:
@@ -485,40 +488,41 @@ class Downloader:
             return False
 
     def _handle_download_error(
-        self, 
-        download: TorrentDownload, 
-        error: RealDebridError,
+        self,
+        download: TorrentDownload,
+        error,
         stream: Stream
     ):
-        """Handle download errors with proper categorization."""
-        
-        if error.error_type == RealDebridErrorType.LEGAL_BLOCKED:
-            # 451 - Legal block, don't retry
+        """Handle download errors with proper categorization (works for RD and TorBox)."""
+        error_type = error.error_type
+
+        # Legal blocks
+        legal_types = {RealDebridErrorType.LEGAL_BLOCKED, TorBoxErrorType.LEGAL_BLOCKED}
+        if error_type in legal_types:
             download.mark_legal_error(error.message)
-            logger.warning(f"Torrent blocked (451): {stream.raw_title}")
-        
-        elif error.error_type == RealDebridErrorType.RATE_LIMITED:
-            # 429 - Rate limited, retry after cooldown
+            logger.warning(f"Torrent blocked (legal): {stream.raw_title}")
+
+        # Rate limited
+        elif error_type in {RealDebridErrorType.RATE_LIMITED, TorBoxErrorType.RATE_LIMITED}:
             download.mark_failed(error.message, cooldown_hours=1)
             logger.warning(f"Rate limited, will retry in 1 hour: {stream.raw_title}")
-        
-        elif error.error_type == RealDebridErrorType.NOT_FOUND:
-            # 404 - Torrent not found
+
+        # Not found
+        elif error_type in {RealDebridErrorType.NOT_FOUND, TorBoxErrorType.NOT_FOUND}:
             download.mark_failed(error.message, cooldown_hours=24)
             logger.debug(f"Torrent not found: {stream.raw_title}")
-        
-        elif error.error_type == RealDebridErrorType.INVALID_TORRENT:
-            # 400 - Invalid torrent
+
+        # Invalid torrent
+        elif error_type in {RealDebridErrorType.INVALID_TORRENT, TorBoxErrorType.INVALID_TORRENT}:
             download.mark_skipped(error.message)
             logger.debug(f"Invalid torrent: {stream.raw_title}")
-        
-        elif error.error_type == RealDebridErrorType.SERVICE_ERROR:
-            # 5xx - Server error, retry later
+
+        # Service error
+        elif error_type in {RealDebridErrorType.SERVICE_ERROR, TorBoxErrorType.SERVICE_ERROR}:
             download.mark_failed(error.message, cooldown_hours=6)
             logger.warning(f"Service error, will retry in 6 hours: {stream.raw_title}")
-        
+
         else:
-            # Unknown error
             download.mark_failed(error.message, cooldown_hours=24)
             logger.error(f"Unknown error: {error.message}")
 

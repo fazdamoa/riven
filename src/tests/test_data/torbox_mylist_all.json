@@ -1,0 +1,27 @@
+{
+  "success": true,
+  "error": null,
+  "detail": "Torrents found",
+  "data": [
+    {
+      "id": 251993753,
+      "hash": "3648baf850d5930510c1f172b534200ebb5496e6",
+      "name": "ubuntu-24.04-desktop-amd64.iso",
+      "download_state": "downloaded",
+      "cached": true,
+      "download_finished": true,
+      "download_present": true,
+      "progress": 100.0,
+      "size": 6114906112,
+      "created_at": "2024-05-01T10:00:00Z",
+      "files": [
+        {
+          "id": 1,
+          "name": "ubuntu-24.04-desktop-amd64.iso",
+          "short_name": "ubuntu-24.04-desktop-amd64.iso",
+          "size": 6114906112
+        }
+      ]
+    }
+  ]
+}

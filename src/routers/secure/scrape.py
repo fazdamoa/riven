@@ -18,10 +18,11 @@ from program.media.stream import Stream as ItemStream
 from program.services.downloaders import Downloader
 from program.services.indexers.trakt import TraktIndexer
 from program.services.scrapers import Scraping
-from program.services.scrapers.shared import rtn
+from program.services.scrapers.shared import manual_rtn
 from program.types import Event
 from program.services.downloaders.models import TorrentContainer, TorrentInfo, DebridFile
 from program.services.downloaders.realdebrid import RealDebridError, RealDebridErrorType
+from program.services.downloaders.torbox import TorBoxError, TorBoxErrorType
 
 
 class Stream(BaseModel):
@@ -105,7 +106,15 @@ class ScrapingSession:
         self.containers: Optional[TorrentContainer] = None
         self.selected_files: Optional[Dict[str, Dict[str, Union[str, int]]]] = None
         self.created_at: datetime = datetime.now()
-        self.expires_at: datetime = datetime.now() + timedelta(minutes=5)
+        from program.settings.manager import settings_manager
+        _session_timeout_minutes = 5  # Real-Debrid default
+        try:
+            if settings_manager.settings.downloaders.torbox.enabled:
+                # TorBox WebDAV refresh cycle + add-then-cache delays need more headroom
+                _session_timeout_minutes = 15
+        except Exception:
+            pass
+        self.expires_at: datetime = datetime.now() + timedelta(minutes=_session_timeout_minutes)
 
 class ScrapingSessionManager:
     def __init__(self):
@@ -120,6 +129,11 @@ class ScrapingSessionManager:
         """Create a new scraping session"""
         session_id = str(uuid4())
         session = ScrapingSession(session_id, item_id, magnet)
+        # Extend session expiry when TorBox is active (15-min WebDAV refresh cycle)
+        if self.downloader and hasattr(self.downloader, 'service'):
+            from program.services.downloaders.torbox import TorBoxDownloader
+            if isinstance(self.downloader.service, TorBoxDownloader):
+                session.expires_at = datetime.now() + timedelta(minutes=15)
         self.sessions[session_id] = session
         return session
 
@@ -226,7 +240,7 @@ def scrape_item(request: Request, id: str) -> ScrapeItemResponse:
         if not item:
             raise HTTPException(status_code=404, detail="Item not found")
 
-        streams: Dict[str, Stream] = scraper.scrape(item)
+        streams: Dict[str, Stream] = scraper.scrape(item, manual=True)
         log_string = item.log_string
 
     return {
@@ -333,22 +347,16 @@ async def start_manual_session(
             if status.needs_file_selection:
                 logger.debug(f"[ManualScrape] Torrent needs file selection...")
                 logger.debug(f"[ManualScrape] Available files: {list(status.files.keys()) if status.files else 'None'}")
-                
-                # Select all files directly
+
                 try:
-                    from program.utils.request import HttpMethod
-                    service.api.request_handler.execute(
-                        HttpMethod.POST,
-                        f"torrents/selectFiles/{torrent_id}",
-                        data={"files": "all"}
-                    )
-                    logger.debug(f"[ManualScrape] Selected all files")
+                    service.select_video_files(torrent_id)
+                    logger.debug(f"[ManualScrape] File selection complete")
                 except Exception as select_err:
                     logger.error(f"[ManualScrape] File selection failed: {select_err}")
-                
-                # Wait for RD to process
+
+                # Wait for debrid service to process
                 time.sleep(2)
-                
+
                 # Re-check status
                 status = service.get_torrent_status(torrent_id)
                 logger.debug(f"[ManualScrape] Status after file selection: {status.status}")
@@ -394,10 +402,12 @@ async def start_manual_session(
             else:
                 logger.warning(f"[ManualScrape] Unexpected final status: {status.status}")
                 
-        except RealDebridError as e:
+        except (RealDebridError, TorBoxError) as e:
             logger.error(f"[ManualScrape] Failed to add torrent: {e.message} (type={e.error_type})")
-            if e.error_type == RealDebridErrorType.LEGAL_BLOCKED:
+            if e.error_type in (RealDebridErrorType.LEGAL_BLOCKED, TorBoxErrorType.LEGAL_BLOCKED):
                 raise HTTPException(status_code=400, detail="Torrent is blocked for legal reasons (DMCA)")
+            if e.error_type in (RealDebridErrorType.RATE_LIMITED, TorBoxErrorType.RATE_LIMITED):
+                raise HTTPException(status_code=429, detail=f"Rate limited: {e.message}")
             raise HTTPException(status_code=400, detail=f"Failed to add torrent: {e.message}")
         except HTTPException:
             raise  # Re-raise HTTP exceptions from the inner logic
@@ -524,7 +534,10 @@ async def manual_update_attributes(request: Request, session_id, data: Union[Deb
             item.folder = data.filename
             item.alternative_folder = session.torrent_info.alternative_filename
             item.active_stream = {"infohash": session.magnet, "id": session.torrent_info.id}
-            torrent = rtn.rank(session.torrent_info.name, session.magnet)
+            # Use the permissive ranker with trash removal off: the user has
+            # explicitly chosen this torrent (possibly low-res), so the strict
+            # ranker must not be allowed to raise GarbageTorrent here.
+            torrent = manual_rtn.rank(session.torrent_info.name, session.magnet, remove_trash=False)
             item.streams.append(ItemStream(torrent))
             item_ids_to_submit.add(item.id)
 

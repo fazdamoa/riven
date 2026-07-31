@@ -324,6 +324,104 @@ def fix_broken_symlinks(library_path, rclone_path, max_workers=4, specific_direc
     logger.log("FILES", f"Finished processing and retargeting broken symlinks. Time taken: {elapsed_time:.2f} seconds.")
     logger.log("FILES", f"Reset {missing_files} items to be rescraped due to missing rclone files.")
 
+def audit_missing_symlinks(library_path, rclone_path) -> List[int]:
+    """
+    DB-vs-disk symlink audit — the inverse of fix_broken_symlinks.
+
+    fix_broken_symlinks handles symlinks that exist on disk but point at
+    missing rclone files. It cannot see items whose symlink has been deleted
+    from disk entirely (e.g. by an earlier repair pass, a migration, or manual
+    cleanup) while the database still marks them symlinked — those items look
+    "Completed" forever and never re-acquire.
+
+    This audit walks every on-disk symlink, then checks each DB item marked
+    symlinked against it: an item passes if its recorded symlink_path exists
+    on disk, or if its original filename appears as any on-disk link target
+    (fallback for items predating the symlink_path column). Misses are reset
+    so they re-enter the pipeline. Returns the reset item ids so the caller
+    can emit retry events.
+    """
+    from program.media.item import Episode, Movie
+
+    start_time = time.time()
+
+    # Collect every symlink currently on disk: their own paths and the
+    # basenames of their targets (the original rclone filenames).
+    disk_link_paths: set = set()
+    disk_target_names: set = set()
+    valid_dirs = ["shows", "movies", "anime_shows", "anime_movies"]
+    for d in valid_dirs:
+        base = os.path.join(str(library_path), d)
+        if not os.path.isdir(base):
+            continue
+        for root, _, files in os.walk(base):
+            for name in files:
+                full_path = os.path.join(root, name)
+                if os.path.islink(full_path):
+                    disk_link_paths.add(full_path)
+                    try:
+                        disk_target_names.add(os.path.basename(os.readlink(full_path)))
+                    except OSError:
+                        pass
+
+    reset_ids: List[int] = []
+    with db.Session() as session:
+        items = (
+            session.query(Movie).filter(Movie.symlinked == True).all()  # noqa: E712
+            + session.query(Episode).filter(Episode.symlinked == True).all()  # noqa: E712
+        )
+
+        if items and not disk_link_paths:
+            # Safety guard: an empty/unmounted library path would otherwise
+            # mass-reset the entire library and hammer the downloader.
+            logger.error(
+                f"Symlink audit: database has {len(items)} symlinked items but no symlinks "
+                f"were found on disk in {library_path} — refusing to mass-reset. "
+                "Check that the library path is mounted and populated."
+            )
+            return []
+
+        missing = []
+        for item in items:
+            symlink_path = getattr(item, "symlink_path", None)
+            if symlink_path and str(symlink_path) in disk_link_paths:
+                continue
+            if item.file and str(item.file) in disk_target_names:
+                continue
+            missing.append(item)
+
+        if not missing:
+            logger.log("FILES", f"Symlink audit: all {len(items)} symlinked items verified on disk.")
+            return []
+
+        fraction = len(missing) / len(items)
+        if fraction > 0.5:
+            logger.warning(
+                f"Symlink audit: {len(missing)}/{len(items)} symlinked items have no symlink on disk "
+                f"({fraction:.0%}) — unusually high; proceeding, but verify the library mount if unexpected."
+            )
+
+        for item in missing:
+            try:
+                item = session.merge(item)
+                logger.log("FILES", f"Symlink audit: resetting {item.log_string} — marked symlinked in DB but no symlink on disk.")
+                item.reset()
+                item.store_state()
+                session.merge(item)
+                session.commit()
+                reset_ids.append(item.id)
+            except Exception as e:
+                logger.error(f"Symlink audit: failed to reset {getattr(item, 'log_string', item)}: {e}")
+                session.rollback()
+
+    logger.log(
+        "FILES",
+        f"Symlink audit: reset {len(reset_ids)} item(s) in {time.time() - start_time:.2f}s; "
+        f"they will be re-scraped and re-acquired."
+    )
+    return reset_ids
+
+
 def get_items_from_filepath(session: Session, filepath: str) -> list["MediaItem"]:
     """Get an item by its filepath."""
     from program.db.db_functions import get_item_by_imdb_and_episode, get_item_by_symlink_path

@@ -367,12 +367,26 @@ class Program(threading.Thread):
         except Exception as e:
             logger.error(f"Error cleaning up download records: {e}")
 
+    def _audit_symlinks(self) -> None:
+        """DB-vs-disk symlink audit: reset and re-acquire items the database
+        marks as symlinked whose symlink no longer exists on disk."""
+        try:
+            from program.services.libraries.symlink import audit_missing_symlinks
+            item_ids = audit_missing_symlinks(
+                settings_manager.settings.symlink.library_path,
+                settings_manager.settings.symlink.rclone_path,
+            )
+            for item_id in item_ids:
+                self.em.add_event(Event(emitted_by="RetryLibrary", item_id=item_id))
+        except Exception as e:
+            logger.error(f"Error running symlink audit: {e}")
+
     def _schedule_functions(self) -> None:
         """Schedule each service based on its update interval."""
         scheduled_functions = {
             self._update_ongoing: {"interval": 60 * 60 * 4},
             self._retry_library: {"interval": 60 * 60 * 24},
-            self._check_active_downloads: {"interval": 60 * 5},  # Check every 5 minutes
+            self._check_active_downloads: {"interval": 60},  # TorBox: check every minute
             self._cleanup_download_records: {"interval": 60 * 60 * 24},  # Daily cleanup
             log_cleaner: {"interval": 60 * 60},
             vacuum_and_analyze_index_maintenance: {"interval": 60 * 60 * 24},
@@ -382,6 +396,11 @@ class Program(threading.Thread):
             scheduled_functions[fix_broken_symlinks] = {
                 "interval": 60 * 60 * settings_manager.settings.symlink.repair_interval,
                 "args": [settings_manager.settings.symlink.library_path, settings_manager.settings.symlink.rclone_path]
+            }
+            # DB-vs-disk audit: catches items marked symlinked whose symlink
+            # was deleted from disk (invisible to fix_broken_symlinks).
+            scheduled_functions[self._audit_symlinks] = {
+                "interval": 60 * 60 * settings_manager.settings.symlink.repair_interval,
             }
             # logger.warning("Symlink repair is disabled, this will be re-enabled in the future.")
 

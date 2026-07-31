@@ -1,0 +1,11 @@
+{
+  "success": true,
+  "error": null,
+  "detail": "Torrent added successfully",
+  "data": {
+    "torrent_id": 251993753,
+    "hash": "3648baf850d5930510c1f172b534200ebb5496e6",
+    "name": "ubuntu-24.04-desktop-amd64.iso",
+    "auth_id": "abc123"
+  }
+}

@@ -84,15 +84,28 @@ class Symlinker:
             return False
         return True
 
+    def _get_soft_reset_threshold(self) -> int:
+        """Return the symlinked_times value at which a soft reset is triggered."""
+        try:
+            from program.settings.manager import settings_manager as _sm
+            if _sm.settings.downloaders.torbox.enabled:
+                return 25  # TorBox: 25 × 45s fixed retries ≈ 19 min before soft reset
+        except Exception:
+            pass
+        return 6  # Real-Debrid default
+
     def run(self, item: Union[Movie, Show, Season, Episode]):
         """Check if the media item exists and create a symlink if it does"""
         items = self._get_items_to_update(item)
         if not items:
             logger.debug(f"No items to symlink for {item.log_string}")
             yield item
+            return
+
+        soft_reset_threshold = self._get_soft_reset_threshold()
 
         if not self._should_submit(items):
-            if item.symlinked_times == 6:
+            if item.symlinked_times == soft_reset_threshold:
                 logger.log("SYMLINKER", f"Soft resetting {item.log_string} because required files were not found")
                 for _item in items:
                     _item.soft_reset()
@@ -120,24 +133,36 @@ class Symlinker:
 
         yield item
 
+    def _is_torbox_active(self) -> bool:
+        """Return True when TorBox is the active downloader."""
+        try:
+            from program.settings.manager import settings_manager as _sm
+            return bool(_sm.settings.downloaders.torbox.enabled)
+        except Exception:
+            return False
+
     def _calculate_next_attempt(self, item: Union[Movie, Show, Season, Episode]) -> datetime:
+        if self._is_torbox_active():
+            # Fixed cadence: file appears within one WebDAV cycle (≤15 min),
+            # usually within seconds of an RC vfs/refresh. Exponential backoff
+            # is the wrong shape for a bounded-delay event.
+            return datetime.now() + timedelta(seconds=45)
         base_delay = timedelta(seconds=4)
-        next_attempt_delay = base_delay * (2 ** item.symlinked_times)
-        next_attempt_time = datetime.now() + next_attempt_delay
-        return next_attempt_time
+        next_attempt_delay = min(base_delay * (2 ** item.symlinked_times), timedelta(minutes=4))
+        return datetime.now() + next_attempt_delay
 
     def _should_submit(self, items: Union[Movie, Show, Season, Episode]) -> bool:
         """Check if the item should be submitted for symlink creation."""
         random_item = random.choice(items)
         path = _get_item_path(random_item)
-        
+
         if not path:
-            # Try triggering a Zurg refresh and check again
-            if _trigger_zurg_refresh():
+            # Try triggering a mount refresh and check again
+            if _trigger_mount_refresh():
                 import time
-                time.sleep(2)  # Give Zurg a moment to refresh
+                time.sleep(5)  # Give a recursive vfs/refresh on a large flat root time to settle
                 path = _get_item_path(random_item)
-        
+
         return path is not None
 
     def _get_items_to_update(self, item: Union[Movie, Show, Season, Episode]) -> List[Union[Movie, Episode]]:
@@ -356,25 +381,101 @@ def _get_item_path(item: Union[Movie, Episode]) -> Optional[Path]:
             if file_path.exists():
                 return file_path
     
-    # Try searching recursively (slower but more thorough)
-    # This handles cases where Zurg organizes files differently
+    # rglob fallback is only useful for zurg-style nested layouts; with TorBox
+    # WebDAV Flatten the root + folder checks above are exhaustive, and rglob
+    # over WebDAV is a PROPFIND storm. Likewise the iterdir "force refresh" is
+    # replaced by the rclone RC vfs/refresh for TorBox.
+    torbox_active = False
     try:
-        for path in rclone_path.rglob(item.file):
-            if path.is_file():
-                logger.debug(f"Found file via rglob: {path}")
-                return path
-    except Exception as e:
-        logger.debug(f"rglob search failed: {e}")
-    
-    # Try to force a directory refresh by listing the directory
-    # This can help with Zurg/rclone cache issues
-    try:
-        list(rclone_path.iterdir())
+        torbox_active = settings_manager.settings.downloaders.torbox.enabled
     except Exception:
         pass
+
+    if not torbox_active:
+        # Try searching recursively (slower but more thorough)
+        # This handles cases where Zurg organizes files differently
+        try:
+            for path in rclone_path.rglob(item.file):
+                if path.is_file():
+                    logger.debug(f"Found file via rglob: {path}")
+                    return path
+        except Exception as e:
+            logger.debug(f"rglob search failed: {e}")
+
+        # Try to force a directory refresh by listing the directory
+        # This can help with Zurg/rclone cache issues
+        try:
+            list(rclone_path.iterdir())
+        except Exception:
+            pass
     
     logger.debug(f"File not found anywhere in rclone_path for {item.log_string}: file='{item.file}', folder='{item.folder}'")
     return None
+
+
+def _trigger_mount_refresh() -> bool:
+    """
+    Trigger a mount refresh appropriate to the active downloader.
+
+    - TorBox: hits webdav.torbox.app refresh URL (rate-limited to 1/60s)
+    - Real-Debrid / fallback: PROPFIND against the Zurg WebDAV endpoint
+    """
+    try:
+        from program.settings.manager import settings_manager as _sm
+        if _sm.settings.downloaders.torbox.enabled:
+            return _trigger_torbox_refresh(_sm.settings.downloaders.torbox.api_key)
+    except Exception:
+        pass
+    return _trigger_zurg_refresh()
+
+
+# Module-level throttle for TorBox refresh calls
+_torbox_last_refresh: Optional[datetime] = None
+_TORBOX_REFRESH_INTERVAL = 60  # seconds
+
+
+def _trigger_torbox_refresh(api_key: str) -> bool:
+    """
+    Flush rclone's directory cache via the rclone RC API so new TorBox files
+    become visible without waiting for dir-cache-time to expire.
+
+    Requires rclone to be started with --rc --rc-addr :5572 --rc-no-auth.
+    Rate-limited to one call per 60 seconds.
+    """
+    global _torbox_last_refresh
+    import requests
+
+    now = datetime.now()
+    if (
+        _torbox_last_refresh is not None
+        and (now - _torbox_last_refresh).total_seconds() < _TORBOX_REFRESH_INTERVAL
+    ):
+        logger.debug("TorBox rclone RC refresh skipped (throttled)")
+        return False
+
+    # rclone RC endpoints to try — container name first, then localhost
+    rc_hosts = ["http://rclone:5572", "http://localhost:5572"]
+
+    for host in rc_hosts:
+        try:
+            # vfs/refresh flushes the directory cache for the mount
+            response = requests.post(
+                f"{host}/vfs/refresh",
+                json={"recursive": "true"},
+                timeout=10,
+            )
+            if response.status_code == 200:
+                _torbox_last_refresh = now
+                logger.debug(f"TorBox rclone RC vfs/refresh succeeded via {host}")
+                return True
+            else:
+                logger.debug(f"TorBox rclone RC returned {response.status_code} from {host}")
+        except Exception as e:
+            logger.debug(f"TorBox rclone RC unreachable at {host}: {e}")
+            continue
+
+    logger.debug("TorBox rclone RC not reachable on any host; built-in 15-min refresh will handle it")
+    return False
 
 
 def _trigger_zurg_refresh() -> bool:
@@ -383,13 +484,13 @@ def _trigger_zurg_refresh() -> bool:
     This helps when files are added to RD but Zurg hasn't seen them yet.
     """
     import requests
-    
+
     # Common Zurg endpoints
     zurg_urls = [
         "http://localhost:9999/http/dav",  # Default Zurg WebDAV
         "http://zurg:9999/http/dav",        # Docker network name
     ]
-    
+
     for url in zurg_urls:
         try:
             # A PROPFIND request forces Zurg to refresh its cache
@@ -399,5 +500,5 @@ def _trigger_zurg_refresh() -> bool:
                 return True
         except Exception:
             continue
-    
+
     return False

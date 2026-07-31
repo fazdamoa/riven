@@ -1,0 +1,14 @@
+{
+  "success": true,
+  "error": null,
+  "detail": "Found cached torrent",
+  "data": {
+    "3648baf850d5930510c1f172b534200ebb5496e6": {
+      "name": "ubuntu-24.04-desktop-amd64.iso",
+      "size": 6114906112,
+      "files": [
+        {"name": "ubuntu-24.04-desktop-amd64.iso", "size": 6114906112}
+      ]
+    }
+  }
+}

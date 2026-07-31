@@ -9,13 +9,17 @@ services:
         ports:
             - 3000:3000
         volumes:
-            - ./config:/riven/config # You need to mount a config directory here (different from riven)
+            - ./config:/riven/config
         depends_on:
             riven:
                 condition: service_started
 
     riven:
-        image: spoked/riven:latest
+        # Build locally from this repo so backend changes are picked up without
+        # waiting for the upstream fazdamoa image to be rebuilt.
+        # Run: docker compose build riven && docker compose up -d riven
+        build: .
+        image: riven-local:torbox
         container_name: riven
         restart: unless-stopped
         ports:
@@ -24,9 +28,15 @@ services:
         environment:
             - PUID=1000
             - PGID=1000
-            - TZ=America/New_York
+            - TZ=Europe/London
             - RIVEN_FORCE_ENV=true
             - RIVEN_DATABASE_HOST=postgresql+psycopg2://postgres:postgres@riven-db/riven
+            # Mount path for TorBox WebDAV (rclone mounts webdav.torbox.app here)
+            - RIVEN_SYMLINK_RCLONE_PATH=/mnt/torbox
+            # Downloader selection: TorBox ON, Real-Debrid OFF
+            - RIVEN_DOWNLOADERS_REAL_DEBRID_ENABLED=false
+            - RIVEN_DOWNLOADERS_TORBOX_ENABLED=true
+            - RIVEN_DOWNLOADERS_TORBOX_API_KEY=${TORBOX_API_KEY}
         healthcheck:
             test: curl -s http://localhost:8080 >/dev/null || exit 1
             interval: 30s
@@ -54,3 +64,60 @@ services:
             interval: 10s
             timeout: 5s
             retries: 5
+
+    rclone:
+        # Mounts TorBox WebDAV at /mnt/torbox on the host.
+        # TorBox WebDAV: enable "Flatten" in the TorBox dashboard (Settings → Integrations)
+        # so files appear at the root level, matching Riven's _get_item_path fast path.
+        #
+        # The rclone config at /opt/ftplexdata/rclone-torbox.conf must contain:
+        #   [torbox]
+        #   type = webdav
+        #   url = https://webdav.torbox.app
+        #   vendor = other
+        #   user = YOUR_TORBOX_EMAIL
+        #   pass = RCLONE_OBSCURED_PASSWORD   (rclone obscure <yourpassword>)
+        #
+        # NOTE: TorBox WebDAV auth uses your account email + password, NOT the API key.
+        # If you signed up via SSO (no password), set one in the TorBox account settings.
+        image: rclone/rclone:latest
+        container_name: rclone
+        restart: unless-stopped
+        environment:
+            - TZ=Europe/London
+            - PUID=1000
+            - PGID=1000
+        volumes:
+            - /opt/ftplexdata/mnt/torbox:/data:rshared
+            - /opt/ftplexdata/rclone-torbox.conf:/config/rclone/rclone.conf
+            - /opt/ftplexdata/rclone/cache:/cache
+        cap_add:
+            - SYS_ADMIN
+        security_opt:
+            - apparmor:unconfined
+        devices:
+            - /dev/fuse:/dev/fuse:rwm
+        logging:
+            driver: "json-file"
+            options:
+                max-size: "10m"
+                max-file: "3"
+        # TorBox WebDAV refreshes its listing every ~15 min internally.
+        # dir-cache-time=30s means rclone re-reads the directory listing every 30s,
+        # so new files appear within 30s of TorBox's own cache update.
+        command: >
+            mount torbox: /data
+            --allow-non-empty
+            --allow-other
+            --uid=1000 --gid=1000 --umask=002
+            --vfs-cache-mode full
+            --dir-cache-time 30s
+            --vfs-cache-max-size 30G
+            --vfs-cache-max-age 3h
+            --buffer-size 2G
+            --vfs-read-chunk-size 256M
+            --vfs-read-chunk-size-limit off
+            --vfs-read-ahead 2G
+            --cache-dir /cache
+            --low-level-retries 10
+            --log-level INFO

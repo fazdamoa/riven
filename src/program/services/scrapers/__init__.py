@@ -91,8 +91,8 @@ class Scraping:
 
         yield item
 
-    def scrape(self, item: MediaItem, verbose_logging = True) -> Dict[str, Stream]:
-        """Scrape an item."""
+    def scrape(self, item: MediaItem, verbose_logging = True, manual: bool = False) -> Dict[str, Stream]:
+        """Scrape an item. `manual=True` relaxes resolution/rank filters for manual selection in the UI."""
         results: Dict[str, str] = {}
         results_lock = threading.RLock()
 
@@ -123,7 +123,7 @@ class Scraping:
             logger.log("NOT_FOUND", f"No streams to process for {item.log_string}")
             return {}
 
-        sorted_streams: Dict[str, Stream] = _parse_results(item, results, verbose_logging)
+        sorted_streams: Dict[str, Stream] = _parse_results(item, results, verbose_logging, manual=manual)
         if sorted_streams and (verbose_logging and settings_manager.settings.debug):
             top_results: List[Stream] = list(sorted_streams.values())[:10]
             logger.debug(f"Displaying top {len(top_results)} results for {item.log_string}")

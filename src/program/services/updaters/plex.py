@@ -93,12 +93,22 @@ class PlexUpdater:
             if section.type == item_type:
                 for path in paths:
                     if isinstance(item, (Show, Season)):
+                        # Episodes from the same season pack share an update_folder.
+                        # One partial scan covers the whole folder, so deduplicate
+                        # instead of firing a scan per episode.
+                        scanned_folders = set()
                         for episode in items_to_update:
-                            if episode.update_folder and str(path) in str(episode.update_folder):
-                                if self.api.update_section(section, episode):
-                                    updated_episodes.append(episode)
-                                    section_name = section.title
-                                    updated = True
+                            folder = episode.update_folder
+                            if not folder or str(path) not in str(folder):
+                                continue
+                            if folder in scanned_folders:
+                                updated_episodes.append(episode)
+                                continue
+                            if self.api.update_section(section, episode):
+                                scanned_folders.add(folder)
+                                updated_episodes.append(episode)
+                                section_name = section.title
+                                updated = True
                     elif isinstance(item, (Movie, Episode)):
                         if item.update_folder and str(path) in str(item.update_folder):
                             if self.api.update_section(section, item):
