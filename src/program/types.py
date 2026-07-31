@@ -8,7 +8,6 @@ from program.services.content import (
     Mdblist,
     Overseerr,
     PlexWatchlist,
-    TraktContent,
 )
 from program.services.downloaders import (
     RealDebridDownloader,
@@ -32,7 +31,7 @@ from program.symlink import Symlinker
 
 # Typehint classes
 Scraper = Union[Scraping, Torrentio, Knightcrawler, Mediafusion, Orionoid, Jackett, Zilean, Comet]
-Content = Union[Overseerr, PlexWatchlist, Listrr, Mdblist, TraktContent]
+Content = Union[Overseerr, PlexWatchlist, Listrr, Mdblist]
 Downloader = Union[
     RealDebridDownloader,
     AllDebridDownloader,

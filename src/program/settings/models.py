@@ -160,37 +160,11 @@ class PlexWatchlistModel(Updatable):
     update_interval: int = 60
 
 
-class TraktOauthModel(BaseModel):
-    oauth_client_id: str = ""
-    oauth_client_secret: str = ""
-    oauth_redirect_uri: str = ""
-    access_token: str = ""
-    refresh_token: str = ""
-
-
-class TraktModel(Updatable):
-    enabled: bool = False
-    api_key: str = ""
-    watchlist: List[str] = []
-    user_lists: List[str] = []
-    collection: List[str] = []
-    fetch_trending: bool = False
-    trending_count: int = 10
-    fetch_popular: bool = False
-    popular_count: int = 10
-    fetch_most_watched: bool = False
-    most_watched_period: str = "weekly"
-    most_watched_count: int = 10
-    update_interval: int = 86400
-    oauth: TraktOauthModel = TraktOauthModel()
-    proxy_url: str = ""
-
 class ContentModel(Observable):
     overseerr: OverseerrModel = OverseerrModel()
     plex_watchlist: PlexWatchlistModel = PlexWatchlistModel()
     mdblist: MdblistModel = MdblistModel()
     listrr: ListrrModel = ListrrModel()
-    trakt: TraktModel = TraktModel()
 
 
 # Scraper Services
@@ -321,8 +295,20 @@ class RTNSettingsModel(SettingsModel, Observable):
 # Application Settings
 
 
+class TMDBIndexerModel(Observable):
+    api_key: str = ""
+    language: str = "en-US"
+    include_adult: bool = False
+    # TMDB only gives us a bare YYYY-MM-DD air date, where Trakt gave a full UTC
+    # timestamp. Offsetting from midnight stops items becoming scrapeable up to a
+    # day before they actually air. 24h matches Trakt's old behaviour closely.
+    air_date_grace_hours: int = 24
+    request_timeout: int = 30
+
+
 class IndexerModel(Observable):
-    update_interval: int = 60 * 60
+    update_interval: int = 86400
+    tmdb: TMDBIndexerModel = TMDBIndexerModel()
 
 
 class DatabaseModel(Observable):

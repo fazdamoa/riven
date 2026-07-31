@@ -17,10 +17,9 @@ from program.services.content import (
     Mdblist,
     Overseerr,
     PlexWatchlist,
-    TraktContent,
 )
 from program.services.downloaders import Downloader
-from program.services.indexers.trakt import TraktIndexer
+from program.services.indexers.tmdb import TMDBIndexer
 from program.services.libraries import SymlinkLibrary
 from program.services.libraries.symlink import fix_broken_symlinks
 from program.services.post_processing import PostProcessing
@@ -75,11 +74,10 @@ class Program(threading.Thread):
             PlexWatchlist: PlexWatchlist(),
             Listrr: Listrr(),
             Mdblist: Mdblist(),
-            TraktContent: TraktContent(),
         }
 
         self.services = {
-            TraktIndexer: TraktIndexer(),
+            TMDBIndexer: TMDBIndexer(),
             Scraping: Scraping(),
             Symlinker: Symlinker(),
             Updater: Updater(),
@@ -520,7 +518,7 @@ class Program(threading.Thread):
 
     def _enhance_item(self, item: MediaItem) -> MediaItem | None:
         try:
-            enhanced_item = next(self.services[TraktIndexer].run(item, log_msg=False))
+            enhanced_item = next(self.services[TMDBIndexer].run(item, log_msg=False))
             return enhanced_item
         except StopIteration:
             return None
@@ -566,11 +564,11 @@ class Program(threading.Thread):
                                     progress.update(task, advance=1, log=log_message)
                                     continue
 
-                                # Enhance item with Trakt data
+                                # Enhance item with TMDB metadata
                                 try:
                                     enhanced_item = self._enhance_item(item)
                                     if not enhanced_item:
-                                        errors.append(f"Failed to enhance {item.log_string} ({item.imdb_id}) with Trakt Indexer")
+                                        errors.append(f"Failed to enhance {item.log_string} ({item.imdb_id}) with TMDB Indexer")
                                         log_message = f"Failed to enhance: {item.log_string}"
                                         progress.update(task, advance=1, log=log_message)
                                         continue

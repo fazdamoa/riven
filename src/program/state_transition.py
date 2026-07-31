@@ -2,7 +2,7 @@ from loguru import logger
 
 from program.media import MediaItem, States
 from program.services.downloaders import Downloader
-from program.services.indexers.trakt import TraktIndexer
+from program.services.indexers.tmdb import TMDBIndexer
 from program.services.post_processing import PostProcessing, notify
 from program.services.post_processing.subliminal import Subliminal
 from program.services.scrapers import Scraping
@@ -23,7 +23,7 @@ def process_event(emitted_by: Service, existing_item: MediaItem | None = None, c
         return no_further_processing
 
     if content_item or (existing_item is not None and existing_item.last_state == States.Requested):
-        next_service = TraktIndexer
+        next_service = TMDBIndexer
         logger.debug(f"Next service: {next_service.__name__} for {content_item.imdb_id if content_item else existing_item.id}")
         return next_service, [content_item or existing_item]
 

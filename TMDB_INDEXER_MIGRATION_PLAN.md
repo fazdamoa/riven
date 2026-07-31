@@ -1,263 +1,309 @@
 # TMDB Indexer Migration Plan
 
-Replace Trakt with TMDB as the metadata/indexing provider for Riven.
+Replace Trakt with TMDB. **Trakt API access is dead — indexing has been broken for ~1
+week. This is an outage fix.**
 
 Status: **plan only — nothing implemented yet**
 Branch: `fraser`
-Scope owner: indexer + ID resolution. Trakt *content lists* are a separate decision (see §8).
+
+## Decisions (locked)
+
+| # | Decision | Choice |
+|---|---|---|
+| 1 | Existing database | **Hard reset and rebuild from symlinks** (§2). Removes the ID migration, the adoption shim, and most of the risk in earlier drafts |
+| 2 | Item ID scheme | **IMDb-keyed** — `movie_tt…`, `show_tt…`, `season_tt…_{n}`, `episode_tt…_{s}_{e}` (§4) |
+| 3 | Air dates | **`air_date` + 1 day at 00:00 UTC**, tunable via `air_date_grace_hours` (§5.3) |
+| 4 | Anime handling | **Minimal.** No anime in this library; keep the field correct, don't invest in accuracy (§5.2) |
+| 5 | Trakt | **Deleted entirely** — indexer, API client, content service, OAuth, settings, log level (§7) |
+| 6 | Indexer toggle | **Dropped.** A rollback path to a dead API is worthless |
 
 ---
 
-## 1. Why this work is needed
+## 1. Current state — what the outage has and hasn't broken
 
-- Trakt's API now requires a paid plan for the access level Riven uses.
-- Trakt rate limits (the client is configured for 1000 calls / 300s in
-  `src/program/apis/trakt_api.py:65`) throttle library imports and bulk re-index.
-- The hardcoded fallback client ID in `src/program/apis/trakt_api.py:50-53` is a shared
-  community key — it is a single point of failure and is already rate-limit contended.
-- TMDB is free for personal use, has no daily cap, and a far higher throughput ceiling
-  (~50 req/s soft limit).
+Verified against the code:
+
+**Nothing is permanently damaged.** `failed_attempts` is incremented only by the *scraper*
+(`services/scrapers/__init__.py:82`), never the indexer. When `TraktIndexer.run` fails it
+adds to an in-memory `failed_ids` set and `return`s without yielding
+(`indexers/trakt.py:78-83`), so `run_thread_with_db_item` returns `None`
+(`db/db_functions.py:459-461`) and nothing is written to the DB. `failed_ids` is
+in-process and clears on restart.
+
+Items already in the DB sit at `States.Requested` (`item.py:230-231`). Content items that
+failed to index never entered the DB at all — those recover on their own, since content
+services re-emit their full list each poll and `add_item` (`event_manager.py:338`)
+re-queues anything not already present.
 
 ---
 
-## 2. What Trakt actually does in this repo today
+## 2. The approach: hard reset, rebuild from symlinks
 
-Four distinct jobs, only one of which is "the indexer". They must be separated before
-anything is rewritten, because they have different replacements.
+Given re-downloads are acceptable, there is a much better option than either the Alembic
+re-key or the ID-adoption shim from earlier drafts — and it avoids re-downloading anyway.
 
-### 2.1 Metadata indexing (the target of this migration)
+`SymlinkLibrary.run()` (`services/libraries/symlink.py:69-86`) reconstructs the library
+from the symlinks already on disk:
 
-`src/program/services/indexers/trakt.py` → `TraktIndexer`, backed by
-`src/program/apis/trakt_api.py`.
+- `process_items` (`symlink.py:88`) and `process_shows` (`symlink.py:138`) extract
+  `imdb_id` and title from filenames, and season/episode numbers from the directory tree.
+- Every recovered item gets `symlinked=True` and `update_folder="updated"`
+  (`symlink.py:176-181`), which `_determine_state` (`item.py:218-219`) maps directly to
+  **`States.Completed`**.
+- `_init_db_from_symlinks` (`program.py:527`) then runs each stub through the indexer to
+  fill in metadata, and `copy_items` carries the file mapping onto the indexed tree.
+
+So the sequence is: `pg_dump` → `--hard_reset_db` → restart → library rebuilds from disk,
+metadata freshly indexed from TMDB, everything lands at `Completed`, **no re-downloads**.
+
+This eliminates from the plan: the Alembic re-key migration, the ID-adoption shim, mixed
+ID formats, `test_id_adoption.py`, and the two highest-severity rows of the old risk table.
+
+**Verified live against TMDB (2026-07-31).** A stubbed `Completed` show shaped exactly as
+`process_shows` builds it survives a full TMDB re-index: ids unchanged, `file`, `folder`,
+`symlinked` and `update_folder` intact, every stubbed episode still `Completed`, seasons
+that had no files correctly not `Completed`. Same for a movie. See §9.
+
+### 2.1 What the reset actually costs
+
+State that exists only in the database and not on disk is lost:
+
+- **In-flight items** — anything `Requested`/`Indexed`/`Scraped`/`Downloaded` but not yet
+  symlinked, including the week's backlog. Recovered automatically: content services
+  re-emit their lists on next poll (§1). Anything manually requested needs re-requesting.
+- **`blacklisted_streams`** — previously-rejected torrents can be selected again. Expect
+  some churn on first scrape of anything not already complete.
+- **`scraped_times` / `scraped_at`** — scrape backoff (`scrapers/__init__.py:149-168`)
+  resets to zero.
+- **`requested_by` / `requested_at` / `overseerr_id`** — cosmetic, plus Overseerr status
+  linkage for existing items.
+- Any symlink whose filename the regex can't parse (`symlink.py:142-146`) is skipped and
+  its item is simply not recovered.
+
+Related pre-existing defect, found while verifying the above: `copy_items` calls
+`copy_attributes` on **episodes** and **movies** but never on the show itself
+(`indexers/trakt.py:38-51`), so a show row loses `requested_by`, `requested_at`,
+`requested_id` and `overseerr_id` on *every* re-index — not just at reset. Byte-identical
+in `HEAD`, so Trakt has been doing this all along; it does not affect state or download
+preservation, which live on episodes. Out of scope here, worth fixing separately.
+
+### 2.2 One destructive side effect — read before running
+
+`process_shows` **deletes episode files it cannot parse**:
+
+```python
+episode_numbers: list[int] = parse_title(episode).get("episodes", [])
+if not episode_numbers:
+    logger.log("NOT_FOUND", f"Can't extract episode number at path …")
+    # Delete the episode since it can't be indexed
+    os.remove(directory / show / season / episode)     # symlink.py:169
+```
+
+This is pre-existing upstream behaviour, not something this plan introduces, and it
+removes the *symlink* rather than the source file. But the symlink scan is not read-only,
+so: **take a filesystem-level listing of the library before the reset** so anything
+removed can be identified and re-linked. Consider patching this to log-and-skip rather
+than delete as part of this work — it is a one-line change and there is no good reason for
+a library scan to delete data.
+
+### 2.3 The residual risk: numbering differences
+
+`copy_items` (`indexers/trakt.py:38-48`) matches seasons and episodes **by number**. Your
+symlink tree was named according to Trakt's numbering. Where TMDB disagrees, those
+episodes won't match, will land as `Indexed` rather than `Completed`, and will re-scrape
+and re-download.
+
+You've accepted re-downloads, so this is not a blocker. Two practical consequences worth
+knowing:
+
+- The main offender is anime (absolute vs. seasonal numbering) — **not applicable here**.
+  Remaining cases are shows one provider splits and the other keeps whole, and folded
+  miniseries. Expect a small number, not a large one.
+- Re-downloaded episodes get symlinked under TMDB's numbering, so the old Trakt-numbered
+  symlinks become orphaned. Worth a sweep for empty/duplicate season directories
+  afterwards. `repair_symlinks` (`settings/models.py:86`) may help.
+
+§5.4 measures this precisely before you commit.
+
+---
+
+## 3. What Trakt does here today
+
+### 3.1 Metadata indexing — replaced
+
+`services/indexers/trakt.py` → `TraktIndexer`, backed by `apis/trakt_api.py`.
 
 | Call | Trakt endpoint | Purpose |
 |---|---|---|
-| `create_item_from_imdb_id` (`trakt_api.py:222`) | `/search/imdb/{id}?extended=full` | IMDb → Movie/Show with full metadata |
-| `get_show` (`trakt_api.py:191`) | `/shows/{imdb}/seasons?extended=episodes,full` | **whole season+episode tree in one call** |
-| `get_show_aliases` (`trakt_api.py:199`) | `/{type}/{imdb}/aliases` | alternative titles for scraper matching |
-| `map_item_from_data` (`trakt_api.py:303`) | — | maps response → `Movie`/`Show`/`Season`/`Episode` |
+| `create_item_from_imdb_id` (`trakt_api.py:222`) | `/search/imdb/{id}?extended=full` | IMDb → Movie/Show |
+| `get_show` (`trakt_api.py:191`) | `/shows/{imdb}/seasons?extended=episodes,full` | **whole tree in one call** |
+| `get_show_aliases` (`trakt_api.py:199`) | `/{type}/{imdb}/aliases` | alternative titles for scrapers |
+| `map_item_from_data` (`trakt_api.py:303`) | — | response → `Movie`/`Show`/`Season`/`Episode` |
 
-Fields produced: `title`, `year`, `aired_at`, `trakt_id`, `imdb_id`, `tvdb_id`, `tmdb_id`,
-`genres`, `network`, `country`, `language`, `aliases`, `is_anime`, `number`.
+Entry points: `state_transition.py:26`, `program.py:523` (`_enhance_item`),
+`items.py:641`, `scrape.py:219,282,510`.
 
-Entry points into the indexer:
-- `src/program/state_transition.py:26` — every `Requested` item
-- `src/program/program.py:523` (`_enhance_item`) — symlink→DB bootstrap
-- `src/routers/secure/items.py:641` — manual reindex endpoint
-- `src/routers/secure/scrape.py:219,282,510` — manual scrape by IMDb ID
+### 3.2 External-ID resolution — replaced
 
-### 2.2 External-ID resolution (must also move — it is on the same rate limit)
+`get_imdbid_from_tmdb` (`trakt_api.py:256`) — `overseerr_api.py:116`, `listrr_api.py:63`,
+`webhooks.py:58`; `get_imdbid_from_tvdb` (`trakt_api.py:270`) — `webhooks.py:60`.
 
-- `get_imdbid_from_tmdb` (`trakt_api.py:256`) — used by
-  `src/program/apis/overseerr_api.py:116`, `src/program/apis/listrr_api.py:63`,
-  `src/routers/secure/webhooks.py:58`
-- `get_imdbid_from_tvdb` (`trakt_api.py:270`) — used by `src/routers/secure/webhooks.py:60`
+Also currently broken, partially masked because `get_imdbid_from_overseerr`
+(`webhooks.py:49-60`) tries `req.media.imdbId` first. TMDB does this natively via
+`/find/{id}?external_source=…`; Overseerr and Listrr already speak TMDB IDs, so most of
+these calls disappear rather than being translated.
 
-TMDB does this natively and better (`/find/{id}?external_source=...`, plus
-`/movie/{id}` and `/tv/{id}/external_ids` return `imdb_id` directly).
+### 3.3 Content lists — deleted (§7)
 
-### 2.3 Content lists (NOT in this migration — see §8)
+`services/content/trakt.py` → `TraktContent`, plus OAuth at `trakt_api.py:354,371` wired
+to `routers/secure/default.py:93-108`. Unused.
 
-`src/program/services/content/trakt.py` → `TraktContent` (watchlist, collection, user
-lists, trending, popular, most-watched). Also `perform_oauth_flow` /
-`handle_oauth_callback` (`trakt_api.py:354,371`) wired to
-`src/routers/secure/default.py:93-108`.
+### 3.4 Dead code already in the repo
 
-### 2.4 Database identity (the hard part)
-
-`MediaItem.id` is `f"{type}_{trakt_id}"` — `src/program/media/item.py:137-144`.
-
-**Every row in the database — movies, shows, seasons and episodes — is primary-keyed on a
-Trakt ID.** `Season.parent_id`, `Episode.parent_id`, `StreamRelation`,
-`StreamBlacklistRelation` and `Subtitle.parent_id` all FK onto it. This, not the API
-client, is the risk in this migration.
-
-### 2.5 Already present but dead
-
-- `src/program/services/indexers/tmdb.py` — a 454-line TMDB client that **nothing
-  imports**. Wrong layer (an API client living in `services/indexers/`), hardcoded
-  someone else's read token at line 10, and the Pydantic return types are fiction — the
-  shared `get()` helper returns `SimpleNamespace`, not these models. Several models are
-  also wrong (`TmdbItem.title` is required but TV results use `name`;
-  `TmdbSeasonItem.poster_path` is required but is frequently null).
-  **Treat as reference material, not a starting point.** Delete it in Section G.
-- `src/program/apis/tvmaze_api.py` — also unimported. Relevant later (§5, air times).
+- `src/program/services/indexers/tmdb.py` — 454-line TMDB client **nothing imports**.
+  Wrong layer, and its Pydantic return types are fiction (the shared `get()` helper
+  returns `SimpleNamespace`). Models are wrong too: `TmdbItem.title` is required but TV
+  results use `name`; `TmdbSeasonItem.poster_path` is required but often null.
+  **Reference material, not a starting point.** It hardcodes a live third-party TMDB read
+  token at line 10 — treat as leaked, do not carry it over.
+- `src/program/apis/tvmaze_api.py` — unimported; imports `TraktModel` for no reason.
 
 ---
 
-## 3. End state
+## 4. Item IDs
 
-- `src/program/apis/tmdb_api.py` — `TMDBAPI`, same shape as the other API clients
-  (`BaseRequestHandler`, `create_service_session`, registered in `di`).
-- `src/program/services/indexers/tmdb.py` — `TMDBIndexer`, same public contract as
-  `TraktIndexer`: `key`, `initialized`, `run(item, log_msg=True)` generator,
-  `should_submit(item)` staticmethod.
-- `MediaItem.id` derived from TMDB ID (§4.1), with an Alembic data migration that
-  rewrites existing rows **offline, with no network calls**.
-- Trakt code paths for indexing and ID resolution deleted; `TraktContent` left working
-  but explicitly optional.
-- Settings: `content.trakt` untouched; new `indexer.tmdb` block with API key + knobs.
+`movie_tt0111161`, `show_tt0903747`, `season_tt0903747_1`, `episode_tt0903747_1_2`.
+
+With a fresh database there's no compatibility constraint, so pick what fits the codebase.
+IMDb keying wins on two counts:
+
+- **It matches the symlink rebuild.** `SymlinkLibrary` produces stubs carrying only
+  `imdb_id` and `title` (`symlink.py:107,147`), so an IMDb-keyed item gets its final ID at
+  construction, before TMDB is ever called. TMDB keying would leave every stub with a
+  `None` id until indexed.
+- The pipeline is already IMDb-centric: `get_top_imdb_id` (`item.py:388`),
+  `_get_stremio_identifier` (`scrapers/shared.py:208-217`), `jackett.py:165`,
+  `prowlarr.py:253,263`, `scrapers/__init__.py:29,99-100`.
+
+IDs are opaque throughout — `get_item_by_id` (`db_functions.py:24`) is pure equality, and
+nothing parses the format. The one place that inspects an ID is `scrape.py:211,272`, which
+checks `id.startswith("tt")` to tell an IMDb ID from a DB ID; `movie_tt…` does not start
+with `tt`, so that check still works. Verified.
+
+Fallback where TMDB has no IMDb ID: `{type}_tmdb{id}`, logged at `warning`. Such items are
+already on the `keyword_services` scraper path (`scrapers/__init__.py:100`), so this is not
+a regression. The type prefix keeps the namespaces from colliding.
+
+Implementation note: `__generate_composite_key` (`item.py:137-144`) receives only the item
+dict, so a season has no access to its parent's IMDb ID at construction. Assign child IDs
+in `add_season` (`item.py:618`) / `add_episode` (`item.py:756`), which already set `parent`.
+
+Drop the now-unused `trakt_id` column (`item.py:25`) and the `to_dict()` bugs alongside it:
+`item.py:265` returns `tmdb_id` under the `trakt_id` key; `item.py:268` returns `tvdb_id`
+under the `tmdb_id` key.
 
 ---
 
-## 4. Design decisions to lock before writing code
+## 5. TMDB design decisions
 
-### 4.1 Item ID scheme — decide this first
+### 5.1 One request per show
 
-Options:
-
-**(A) `{type}_{tmdb_id}`** — closest to today. Needs TMDB season/episode IDs, so
-season/episode rows can only be re-keyed by re-querying TMDB. Existing rows have no TMDB
-season/episode ID stored, so the Alembic migration would need thousands of network calls.
-
-**(B) Derive children from the parent** — `movie_{tmdb}`, `show_{tmdb}`,
-`season_{show_tmdb}_{n}`, `episode_{show_tmdb}_{s}_{e}`. Deterministic, no per-season API
-call needed to compute a key.
-
-**(C) Key on IMDb instead** — `movie_tt…`, `show_tt…`, `season_tt…_{n}`,
-`episode_tt…_{s}_{e}`.
-
-**Recommendation: (B).** Rationale:
-- The `tmdb_id` column is *already populated* on existing rows — Trakt returned
-  `ids.tmdb` and `map_item_from_data` stored it (`trakt_api.py:324`). So the Alembic
-  migration is a pure SQL re-key using data already in the table. No network.
-- Season/episode keys are computed from the parent show + numbers, which the DB already
-  has, so children re-key offline too.
-- It keeps the provider-native ID as the identity, matching the direction of travel.
-
-Against (C): the scraping layer is IMDb-centric (`get_top_imdb_id`,
-`_get_stremio_identifier` in `src/program/services/scrapers/shared.py:208-217`), so IMDb
-keying is tempting — but TMDB does not guarantee an IMDb ID on every title, and we would
-be keying on a foreign provider's ID while indexing from TMDB. Note that IMDb ID is still
-*required downstream* regardless — see §4.4.
-
-Fallback for rows where the migration cannot resolve a TMDB ID: quarantine them (§6.C),
-do not silently drop.
-
-### 4.2 Keep the `trakt_id` column
-
-Leave `MediaItem.trakt_id` (`item.py:25`) in place, nullable, no longer written. Cheap
-insurance and lets the migration be rolled back. Also fix the three pre-existing bugs in
-`to_dict()` while in there: `item.py:265` returns `tmdb_id` under the `trakt_id` key, and
-`item.py:268` returns `tvdb_id` under the `tmdb_id` key.
-
-### 4.3 One request per show, not one per season
-
-This is the main performance risk. Trakt returned the entire season+episode tree in a
-single call (`trakt_api.py:195`). The naive TMDB port is `1 + N` requests per show.
-
-Use `append_to_response` — TMDB allows up to **20** appended keys:
+Trakt returned the whole tree in one call (`trakt_api.py:195`); the naive TMDB port is
+`1 + N`. Use `append_to_response` (max **20** keys):
 
 ```
-GET /3/tv/{id}?append_to_response=external_ids,alternative_titles,keywords,season/1,season/2,…
+GET /3/tv/{id}?append_to_response=external_ids,alternative_titles,season/1,season/2,…
 ```
 
-Budget: 16 season slots + 4 metadata keys = 20. Shows with >16 seasons fall back to
-batched follow-up requests. Result: 1 request for the overwhelming majority of shows,
-2–3 for long-runners. Document the fallback path in a `logger.debug`.
+17 season slots + 2 metadata keys (no `keywords` — see §5.2). Shows with more seasons get
+batched follow-ups. Movies are one request:
+`GET /3/movie/{id}?append_to_response=alternative_titles,external_ids`.
 
-Movies: `GET /3/movie/{id}?append_to_response=alternative_titles,external_ids,keywords` —
-always 1 request.
+This matters more than usual here: the symlink rebuild indexes the **entire library in one
+pass**, so per-show request count is the dominant cost of the initial import.
 
-### 4.4 IMDb ID is still mandatory
+### 5.2 `is_anime` — keep it correct, keep it cheap
 
-Every scraper keys off IMDb (`scrapers/__init__.py:29,99-100`, `shared.py:208-217`,
-`jackett.py:165`, `prowlarr.py:253,263`). The indexer must therefore still resolve and
-store `imdb_id` for movies and shows.
+Trakt's version (`trakt_api.py:460-478`) tested genres plus country. TMDB has no `anime`
+genre. Since there's no anime in this library and `separate_anime_dirs` defaults to `False`
+(`settings/models.py:85`), don't spend an `append_to_response` slot on the `keywords` call.
 
-- Movie: `/movie/{id}` details include `imdb_id` directly.
-- TV: `/tv/{id}/external_ids` gives both `imdb_id` and `tvdb_id` — append it (§4.3).
-- If TMDB returns no IMDb ID: log at `warning`, still index the item, and let the
-  existing `keyword_services` scraper path handle it (`scrapers/__init__.py:100` already
-  branches on missing IMDb). Do **not** hard-fail as `TraktIndexer` does at
-  `indexers/trakt.py:61-63`.
+Heuristic only: genre ID `16` (Animation) **and** (`origin_country` ∩ `{JP,KR,CN,HK,TW}`
+or `original_language` ∈ `{ja,ko,zh}`).
 
-### 4.5 `is_anime` needs reimplementing
+Keep computing once on the show and propagating down (`trakt.py:35-48`,
+`item.py:686,795`) — the field still feeds ranking, so it must be present and sane, just
+not perfect. *(If anime is ever added, upgrade to TMDB keyword `210024`.)*
 
-Trakt's version (`trakt_api.py:460-478`) tests for genres `animation|donghua|anime` plus
-country in `jp|kr|cn|hk`. TMDB has no `anime` genre.
+### 5.3 Two field-mapping traps
 
-Replacement, in priority order:
-1. **TMDB keyword `210024` ("anime")** via `append_to_response=keywords`. This is the
-   accurate signal and is strictly better than what Trakt gave us.
-2. Fallback heuristic: genre ID `16` (Animation) **and** (`origin_country` ∩
-   `{JP, KR, CN, HK, TW}` or `original_language` ∈ `{ja, ko, zh}`).
+**Case.** Trakt returned country and genre values **lowercase**; TMDB returns them
+**uppercase**. `scrapers/shared.py:86` filters aliases against
+`ranking_settings.languages.exclude`, which holds lowercase codes. Miss this and
+alias-based language exclusion silently stops working with no error anywhere. Lowercase
+`iso_3166_1`, `genres[].name` and `origin_country` on the way in.
 
-Keep the existing behaviour of computing it once on the show and propagating down to
-seasons/episodes (`indexers/trakt.py:35-48` `copy_items`, and `item.py:686,795`).
+Alias payload shapes differ: movie → `{"titles": [...]}`, TV → `{"results": [...]}`. Fold
+`original_title`/`original_name` in as an alias — Trakt usually included it and RTN
+matching benefits.
 
-### 4.6 Aliases — watch the case
+**Air dates — `air_date` + 1 day at 00:00 UTC.** Trakt `first_aired` was a full UTC
+timestamp; TMDB `air_date` is a bare `YYYY-MM-DD`. `is_released` (`item.py:205-208`)
+compares `aired_at <= datetime.now()`, so naive midnight parsing makes items scrapeable up
+to ~24h early → wasted scrapes. Trakt's timestamps for US primetime were typically
+00:00–04:00 UTC the following day, so +1 day closely approximates prior behaviour and errs
+safe. Expose `air_date_grace_hours` (default 24).
 
-`get_show_aliases` returned `{country_code: [titles]}` with **lowercase** Trakt country
-codes. `src/program/services/scrapers/shared.py:86` filters that dict against
-`ranking_settings.languages.exclude`, which holds lowercase codes.
+### 5.4 Pre-reset diff — measure the numbering delta
 
-TMDB `alternative_titles` returns `iso_3166_1` **uppercase**. The mapper must
-`.lower()` the key or alias-based language exclusion silently stops working — a silent
-scraper-quality regression with no error anywhere.
+Before the hard reset, run a read-only pass that walks the **current** database and
+compares each show's season/episode structure against TMDB, reporting divergences. Needs
+`TMDBAPI` (§6A) but not `TMDBIndexer`, so it slots in between the two.
 
-Shape: movie → `{"titles": [{"iso_3166_1", "title", "type"}]}`; TV →
-`{"results": [...]}`. Note the different top-level key. Also fold in
-`original_title` / `original_name` as an alias under the origin country — Trakt's alias
-list usually included it and RTN matching benefits.
+Output: per-show numbering deltas plus a total count of episodes that would land as
+`Indexed` rather than `Completed` after the rebuild — i.e. exactly how much re-downloading
+to expect. Cheap to build, turns §2.3 from a guess into a number.
 
-### 4.7 `aired_at` loses time-of-day — behaviour change, needs a decision
+If the count is small, proceed. If it's surprisingly large, that's a signal something is
+wrong with the mapping rather than with TMDB.
 
-Trakt `first_aired` was a full UTC timestamp. TMDB `air_date` is a bare `YYYY-MM-DD`.
+### 5.5 IMDb ID still mandatory downstream
 
-`is_released` (`item.py:205-208`) compares `aired_at <= datetime.now()`, and
-`_determine_state` (`item.py:228-230`) uses it to move items out of `Unreleased`. Parsing
-a bare date to local midnight makes items eligible for scraping up to ~24h before the
-episode actually exists → wasted scrape cycles and `Failed` items.
+Every scraper keys off IMDb (§4). `TMDBIndexer` must resolve and store it: movie details
+include `imdb_id` directly; TV needs `external_ids` appended (which also yields `tvdb_id`
+— note `tvdb_id` does not exist for movies). Where TMDB returns none, log `warning` and
+index anyway — do **not** hard-fail as `TraktIndexer` does at `trakt.py:61-63`.
 
-Options:
-- **(i) `air_date` + 1 day at 00:00 UTC** *(recommended default)*. Trakt's timestamps for
-  US primetime were typically 00:00–04:00 UTC the following day, so this approximates the
-  old behaviour closely and errs on the safe side.
-- (ii) Bare midnight + a `indexer.tmdb.air_date_grace_hours` setting (default 24).
-- (iii) Wire up the already-present-but-unused `src/program/apis/tvmaze_api.py` for exact
-  air times on TV. Most accurate, most work, extra dependency. Defer.
+Note the symlink rebuild is entirely IMDb-driven (`symlink.py:142`), so any library item
+TMDB can't match by IMDb will fail to import. Log these as a list at the end of the rebuild.
 
-Go with (i), and expose (ii) as the knob so it can be tuned without a code change.
+### 5.6 Auth and rate limiting
 
-### 4.8 Auth and rate limiting
+- `Authorization: Bearer <API Read Access Token>` (v4 token works on v3 endpoints).
+  Setting `indexer.tmdb.api_key`, env `RIVEN_INDEXER_TMDB_API_KEY`, legacy fallback
+  `TMDB_API_KEY`. **Ship no hardcoded token** (§3.4).
+- `get_rate_limit_params(max_calls=40, period=10)`.
+- Caching as TVMaze does it (`tvmaze_api.py:34-36`): `get_cache_params("tmdb", 86400)`,
+  bypass via `SKIP_TMDB_CACHE=true`. Matters for the full-library import — a retry after a
+  partial failure should hit cache, not TMDB.
 
-- Auth via `Authorization: Bearer <API Read Access Token>` (the v4 token works against v3
-  endpoints). Settings key `indexer.tmdb.api_key`, env
-  `RIVEN_INDEXER_TMDB_API_KEY`, with legacy env fallback `TMDB_API_KEY`.
-- **Do not ship a hardcoded token.** `services/indexers/tmdb.py:10` currently embeds a
-  live third-party read token; that file is being deleted, and the token must not be
-  carried over. Treat it as leaked and do not reuse it anywhere.
-- `get_rate_limit_params(max_calls=40, period=10)` — comfortably under TMDB's limit.
-- Enable response caching like TVMaze does (`tvmaze_api.py:34-36`):
-  `get_cache_params("tmdb", 86400)`, bypassable via `SKIP_TMDB_CACHE=true`. Show metadata
-  is near-static; this is where the real speedup over Trakt comes from.
+### 5.7 Field mapping reference
 
----
-
-## 5. Field mapping reference
-
-| MediaItem field | Trakt source | TMDB source |
+| MediaItem field | Trakt | TMDB |
 |---|---|---|
 | `title` | `title` | movie `title` / tv `name` |
 | `year` | `year` | `release_date[:4]` / `first_air_date[:4]` |
-| `aired_at` | `released` / `first_aired` | `release_date` / `first_air_date` / season `air_date` / episode `air_date` (§4.7) |
+| `aired_at` | `released` / `first_aired` | `release_date` / `first_air_date` / `air_date` (§5.3) |
 | `imdb_id` | `ids.imdb` | movie `imdb_id` / tv `external_ids.imdb_id` |
 | `tvdb_id` | `ids.tvdb` | tv `external_ids.tvdb_id`; **null for movies** |
 | `tmdb_id` | `ids.tmdb` | `id` |
-| `trakt_id` | `ids.trakt` | — (stop writing, §4.2) |
-| `genres` | `genres` (lowercase slugs) | `genres[].name` — **lowercase these** to preserve behaviour |
+| `genres` | lowercase slugs | `genres[].name` — **lowercase** |
 | `network` | `network` | `networks[0].name` (tv only) |
-| `country` | `country` (lowercase) | `origin_country[0]` / `production_countries[0].iso_3166_1` — **lowercase** |
+| `country` | lowercase | `origin_country[0]` / `production_countries[0].iso_3166_1` — **lowercase** |
 | `language` | `language` | `original_language` |
-| `aliases` | `/aliases` | `alternative_titles` (§4.6) |
-| `is_anime` | genre+country | keyword 210024, else genre 16 + origin (§4.5) |
+| `aliases` | `/aliases` | `alternative_titles` (§5.3) |
+| `is_anime` | genre+country | genre 16 + origin (§5.2) |
 | `number` | `number` | `season_number` / `episode_number` |
-
-Two recurring traps: TMDB returns country/genre values **capitalised** where Trakt
-returned them lowercase, and `tvdb_id` simply does not exist for movies.
-
-Season 0 (specials) is skipped today at `indexers/trakt.py:115-116` — keep skipping it.
 
 ---
 
@@ -265,87 +311,41 @@ Season 0 (specials) is skipped today at `indexers/trakt.py:115-116` — keep ski
 
 ### Section A — `src/program/apis/tmdb_api.py`
 
-New file, modelled on `trakt_api.py` structure (`TMDBAPIError`, `TMDBRequestHandler`,
-`TMDBAPI`). Methods:
+Modelled on `trakt_api.py` (`TMDBAPIError`, `TMDBRequestHandler`, `TMDBAPI`):
 
 - `validate()` → `GET /3/configuration`
-- `get_movie(tmdb_id)` → details + `alternative_titles,external_ids,keywords`
-- `get_show(tmdb_id, season_numbers)` → details + appended seasons (§4.3)
-- `get_season(tmdb_id, n)` → fallback for shows exceeding the append budget
-- `find_by_external_id(external_id, source)` → `/find/{id}?external_source={imdb_id|tvdb_id}`
-- `get_imdbid_from_tmdb(tmdb_id, type)` — signature-compatible with the Trakt method
-- `get_imdbid_from_tvdb(tvdb_id, type)` — same
-- `search(query, type, year)` — for the keyword path and future UI search
-- `map_item_from_data(data, item_type, show_context)` — the §5 mapping
-- `_get_aliases`, `_is_anime`, `_parse_air_date` helpers
+- `get_movie(tmdb_id)`, `get_show(tmdb_id, season_numbers)` (§5.1), `get_season(tmdb_id, n)`
+- `find_by_external_id(external_id, source)` → `/find/{id}?external_source=…`
+- `get_imdbid_from_tmdb(tmdb_id, type)` / `get_imdbid_from_tvdb(tvdb_id, type)` —
+  signature-compatible with the Trakt methods so Section C is a drop-in swap
+- `search(query, type, year)`
+- `map_item_from_data(data, item_type, show_context)` — the §5.7 mapping
+- `_get_aliases`, `_is_anime`, `_parse_air_date`
 
-Register in `src/program/apis/__init__.py` with a `__setup_tmdb()` following the existing
-pattern. Unlike the other services, it must initialise **unconditionally** (like Trakt
-does at `__init__.py:20-21`) — the indexer is not optional.
+Register in `apis/__init__.py` via `__setup_tmdb()`, unconditionally.
 
 ### Section B — `src/program/services/indexers/tmdb.py`
 
-Delete the existing dead file's contents, replace with `TMDBIndexer`.
+Replace the dead file's contents with `TMDBIndexer`.
 
-Port from `indexers/trakt.py`, keeping the contract identical:
-- `copy_attributes` / `copy_items` (`trakt.py:26-54`) move over **unchanged** — they are
-  provider-agnostic and preserve user state across a reindex. Do not "improve" them here.
-- `run()` resolves the entry point: item has `tmdb_id` → use directly; else `imdb_id` →
-  `/find`; else bail.
-- `_add_seasons_to_show()` consumes the appended season payloads rather than looping.
+- `copy_attributes` / `copy_items` move over **unchanged** — provider-agnostic, and what
+  carries the symlink file mapping onto the indexed tree during the rebuild (§2).
+- `run()`: resolve entry point (`tmdb_id`, else `imdb_id` via `/find`, else bail).
+- `_add_seasons_to_show()` consumes appended season payloads instead of looping; keep
+  skipping season 0 (`trakt.py:115-116`).
 - `should_submit()` copies over verbatim.
 
-Update `src/program/services/indexers/__init__.py` to export `TMDBIndexer`.
+Swap call sites — direct replacement, no toggle: `state_transition.py:5,26`,
+`program.py:23,82,523`, `items.py:20,641` (also the "no data returned from Trakt" message
+at line 654), `scrape.py:19,219,282,510`. Note `scrape.py:510` constructs `TraktIndexer()`
+directly rather than pulling from `services` — fix that here.
 
-### Section C — Database migration
+### Section C — External-ID resolution swap
 
-New Alembic revision, `down_revision = '834cba7d26b4'`.
+Point at `TMDBAPI`: `apis/overseerr_api.py:8,40,116`, `apis/listrr_api.py:5,37,63`,
+`routers/secure/webhooks.py:9,52,58,60`.
 
-Order matters — FKs must be updated before the parents they point at, or inside a single
-`ON UPDATE CASCADE`-free manual sweep:
-
-1. Add a temp `new_id` column to `MediaItem`.
-2. Populate for movies/shows: `{type}_{tmdb_id}` where `tmdb_id IS NOT NULL`.
-3. Populate seasons: `season_{parent.tmdb_id}_{number}`; episodes:
-   `episode_{grandparent.tmdb_id}_{parent.number}_{number}`.
-4. Rewrite `Season.parent_id`, `Episode.parent_id`, `StreamRelation.parent_id`,
-   `StreamBlacklistRelation.parent_id`, `Subtitle.parent_id`.
-5. Swap `new_id` → `id` across `MediaItem`, `Movie`, `Show`, `Season`, `Episode`.
-6. Rows with no resolvable `tmdb_id`: **do not delete.** Set `last_state = 'Failed'` and
-   log the count and IMDb IDs so they can be re-requested manually.
-
-Write a `downgrade()` that reverses using the retained `trakt_id` column (§4.2).
-
-**Non-negotiable: this migration must be exercised against a copy of the real
-`riven-db` before it runs anywhere else.** Take a `pg_dump` first.
-
-Escape hatch to document for users who would rather not migrate: drop the DB and
-re-bootstrap from symlinks via `_init_db_from_symlinks` (`program.py:527`) — this is a
-supported path and for many libraries is faster and cleaner than the data migration.
-
-### Section D — Call sites
-
-Mechanical `TraktIndexer` → `TMDBIndexer` swap:
-- `src/program/state_transition.py:5,26`
-- `src/program/program.py:23,82,523`
-- `src/routers/secure/items.py:20,641` — also update the "no data returned from Trakt"
-  message at line 654
-- `src/routers/secure/scrape.py:19,219,282,510` — note line 510 constructs
-  `TraktIndexer()` directly rather than pulling from `services`; keep that shape but
-  point at `TMDBIndexer`
-- `src/tests/test_states_processing.py:127-208`
-
-ID resolution swap (§2.2), pointing at `TMDBAPI`:
-- `src/program/apis/overseerr_api.py:8,40,116`
-- `src/program/apis/listrr_api.py:5,37,63`
-- `src/routers/secure/webhooks.py:9,52,58,60`
-
-Overseerr and Listrr both speak TMDB IDs natively, so these become *cheaper* — worth
-noting in the changelog.
-
-### Section E — Settings and env
-
-`src/program/settings/models.py`, extend `IndexerModel` (line 324):
+### Section D — Settings, env, schema
 
 ```python
 class TMDBIndexerModel(Observable):
@@ -356,122 +356,121 @@ class TMDBIndexerModel(Observable):
     request_timeout: int = 30
 
 class IndexerModel(Observable):
-    update_interval: int = 60 * 60
+    update_interval: int = 86400        # raised from 60 * 60
     tmdb: TMDBIndexerModel = TMDBIndexerModel()
 ```
 
-Add to `.env.example` near the existing indexer block (line 24):
-`RIVEN_INDEXER_TMDB_API_KEY`, `SKIP_TMDB_CACHE`. Leave the `TRAKT_API_CLIENT_ID` entry
-but comment it as content-lists-only.
+`.env.example`: add `RIVEN_INDEXER_TMDB_API_KEY`, `SKIP_TMDB_CACHE`.
 
-Check `src/tests/test_settings_migration.py` still passes — settings changes have bitten
-this repo before.
+Alembic revision dropping `MediaItem.trakt_id` (§4) — a formality given the reset, but
+keeps migration history coherent for a fresh install.
 
-### Section F — Tests
+The settings models use Pydantic's default `extra="ignore"` — `MigratableBaseModel`
+(`settings/migratable.py:4`) sets no `model_config` and there is no `extra="forbid"`
+anywhere — so removed blocks leave stale keys in `settings.json` harmlessly ignored, and
+`settings_manager.save()` drops them on next write. **Verified.** Confirm
+`test_settings_migration.py` still passes.
 
-- `src/tests/test_data/` — capture real TMDB fixtures, following the
-  `torbox_*.json` convention already in that directory: movie details, TV details with
-  appended seasons, `/find` by IMDb, alternative titles, a >16-season show, an anime show,
-  a show with a null `imdb_id`.
-- New `src/tests/test_tmdb_indexer.py`: mapping correctness, the §4.6 case-lowering, §4.5
-  anime detection, §4.7 air-date handling, ID generation for all four types, and the
-  append-budget fallback.
-- New `src/tests/test_tmdb_migration.py`: run the Alembic revision against a seeded
-  SQLite/PG fixture, assert FK integrity and that unresolvable rows are quarantined, not
-  dropped.
-- Update `src/tests/test_states_processing.py`.
+### Section E — Tests
 
-### Section G — Trakt teardown
+- `src/tests/test_data/` — real TMDB fixtures following the existing `torbox_*.json`
+  convention: movie details, TV with appended seasons, `/find` by IMDb, alternative titles,
+  a >17-season show, a show with null `imdb_id`.
+- `test_tmdb_indexer.py` — mapping, §5.3 lowercasing, §5.3 air dates, ID generation for all
+  four types, append-budget fallback.
+- **`test_symlink_rebuild.py`** — the one that matters now. Feed `SymlinkLibrary`-shaped
+  stubs through `TMDBIndexer` and assert the file mapping survives onto the indexed tree
+  and items land at `Completed`. Guards §2 directly.
+  `test_symlink_library.py` and `test_symlink_creation.py` already exist — extend rather
+  than duplicate.
+- Update `test_states_processing.py:127-208`.
 
-Delete, once Section F is green:
-- `TraktIndexer` class and `src/program/services/indexers/trakt.py`
-- `create_item_from_imdb_id`, `get_show`, `get_show_aliases`, `map_item_from_data`,
-  `get_imdbid_from_tmdb`, `get_imdbid_from_tvdb`, `_get_imdb_id_from_list`,
-  `_get_formatted_date`, `_is_anime` from `trakt_api.py`
-- The hardcoded `CLIENT_ID` fallback (`trakt_api.py:50-53`) — require an explicit key.
-
-Keep (content lists still need them): `TraktContent`, `_fetch_data`, the list/watchlist/
-trending/popular/collection getters, OAuth, `extract_user_list_from_url`,
-`resolve_short_url`, the `TRAKT` log level (`utils/logging.py:54`).
-
-If `TraktContent` is *also* being dropped (§8), `trakt_api.py` and
-`content/trakt.py` delete entirely, along with `src/routers/secure/default.py:93-108`,
-the `TraktModel` settings block, and the `TRAKT` log level.
-
-Also delete `src/program/apis/tvmaze_api.py` unless §4.7 option (iii) is adopted — it is
-dead code that imports `TraktModel` for no reason (`tvmaze_api.py:4,31`).
-
-### Section H — Documentation
+### Section F — Documentation
 
 - `README.md:27` — services table.
-- `CHANGELOG.md` — breaking change notice: **item IDs change**, API consumers reading
-  `id` must re-fetch; state the DB migration and the drop-and-rebootstrap alternative.
-- New `TMDB_DEPLOYMENT.md` covering API key setup and the migration/rollback runbook,
-  matching the `TORBOX_DEPLOYMENT.md` convention.
+- `CHANGELOG.md` — Trakt removed; TMDB API key now required; database reset required, with
+  the §8 runbook.
+- `TMDB_DEPLOYMENT.md` — API key setup and the reset runbook, matching
+  `TORBOX_DEPLOYMENT.md`.
 
 ---
 
-## 7. Verification, in order
+## 7. Trakt removal
+
+No reason to defer — the code is non-functional. Do it with Section B.
+
+Delete: `apis/trakt_api.py`, `services/indexers/trakt.py`, `services/content/trakt.py`,
+`apis/tvmaze_api.py`.
+
+Edit: `apis/__init__.py:9,20-21` · `services/content/__init__.py:8,10` ·
+`services/indexers/__init__.py` · `types.py:11,35` ·
+`settings/models.py:163-186,193` (`TraktOauthModel`, `TraktModel`, `ContentModel.trakt`) ·
+`routers/secure/default.py:10,93-108` (both OAuth endpoints) · `utils/logging.py:54`
+(`TRAKT` log level) · `.env.example:24-25,104-106,355-356` · `README.md:27` ·
+`db_functions.py:411` (`calendar[...]["trakt_id"]`).
+
+---
+
+## 8. Cutover runbook
+
+1. `pg_dump` of `riven-db`. **Also take a full recursive listing of the symlink library**
+   (§2.2 — the scan can delete unparseable episode symlinks).
+2. Record a baseline count of items by `last_state`.
+3. Deploy Sections A–D + §7 with the TMDB API key configured. Do **not** reset yet.
+4. Run the §5.4 diff read-only against the current DB. Review the numbering delta.
+5. Verify §9.1-9.5 against the deployed build.
+6. Stop Riven. `--hard_reset_db`.
+7. Restart. `_init_db_from_symlinks` rebuilds the library via TMDB. Watch for the
+   §5.5 unmatched-IMDb list and the §2.2 deletion log.
+8. Compare final `last_state` counts against the step-2 baseline. Items short of
+   `Completed` are the §2.3 numbering casualties — let them re-scrape.
+9. Re-request anything that was in flight before the reset (§2.1).
+10. Sweep for orphaned season directories left by re-numbered shows (§2.3).
+
+---
+
+## 9. Verification
 
 1. `TMDBAPI.validate()` against a real key.
-2. Index a movie (`tt0111161`) — check all §5 fields, confirm 1 HTTP request.
-3. Index a normal show (`tt0903747`) — season/episode tree, confirm 1 HTTP request.
-4. Index a long-runner (`tt0096697`, 30+ seasons) — confirm the append-budget fallback
-   fires and the tree is still complete.
-5. Index an anime (`tt2560140`) — `is_anime` true, aliases populated with lowercase keys.
-6. Index a title with no IMDb ID — indexes with a warning, does not crash.
-7. Run the Alembic migration against a **copy** of the production DB; assert row counts
-   match pre-migration, zero orphaned FKs, and quarantined rows are logged.
-8. Full pipeline on a fresh request: Requested → Indexed → Scraped → Downloaded →
-   Symlinked → Completed.
-9. Reindex an existing item via `POST /items/{id}/reindex` — user state (`file`, `folder`,
-   `symlinked`, `streams`) survives, i.e. `copy_items` still works.
-10. Overseerr webhook with a TMDB ID → correct IMDb resolution.
-11. `_init_db_from_symlinks` on a small symlink tree.
-12. Full test suite.
+2. Index a movie (`tt0111161`) and a show (`tt0903747`) — check §5.7 fields, confirm 1
+   HTTP request each.
+3. Long-runner (`tt0096697`, 30+ seasons) — append-budget fallback fires, tree complete.
+4. Title with no IMDb ID — indexes with a warning, does not crash.
+5. Symlink-stub round trip: stub → `TMDBIndexer` → `Completed` with file mapping intact.
+6. Full test suite.
+7. Post-reset: §8.8 state-count comparison.
+8. Full pipeline on a fresh request: Requested → … → Completed.
 
 ---
 
-## 8. Explicitly out of scope (decide separately)
-
-- **`TraktContent`** (watchlist / lists / trending). TMDB has no watchlist equivalent
-  without per-user OAuth, and its `/trending` and `/discover` are not like-for-like with
-  Trakt's. If the Trakt plan is being cancelled outright this *must* be addressed, but as
-  its own piece of work — likely TMDB `/trending` + `/discover` for the
-  trending/popular/most-watched settings, and MDBList (already integrated,
-  `content/mdblist.py`) for user lists. Flagging it now: if the paid plan lapses mid-way,
-  content lists break independently of the indexer.
-- Frontend/UI changes for the ID format change.
-- Removing the `trakt_id` column (§4.2 — keep for one release, drop later).
-- TVMaze air times (§4.7 option iii).
-
----
-
-## 9. Risks
+## 10. Risks
 
 | Risk | Severity | Mitigation |
 |---|---|---|
-| ID migration corrupts the DB | **High** | Test on a dump first; `pg_dump` before running; documented drop-and-rebootstrap fallback |
-| Rows with no `tmdb_id` | Medium | Quarantine as `Failed` + log; never silently drop |
-| Alias case mismatch silently degrades scraping | Medium | §4.6 — explicit test with a non-`us` country code |
-| N+1 requests per show | Medium | §4.3 `append_to_response` + response cache; assert request counts in tests |
-| Early scraping from date-only `air_date` | Medium | §4.7 +1 day default, tunable |
-| Anime misdetection changes ranking | Low | Keyword 210024 primary; fixture test on a known anime |
-| Trakt content lists break separately | Medium | §8 — track as its own item |
+| Symlink scan deletes unparseable episode symlinks | **Medium** | §2.2 — filesystem listing first; consider patching `symlink.py:169` to log-and-skip |
+| Numbering differences → re-downloads + orphaned symlinks | Medium | Accepted; §5.4 quantifies it first; §8.10 sweep |
+| In-flight items lost in the reset | Medium | §2.1 — content services re-emit; re-request manual items |
+| Blacklisted streams lost → bad torrents return | Low-Medium | Accepted; they re-blacklist on failure |
+| Alias case mismatch silently degrades scraping | Medium | §5.3; test with a non-`us` country code |
+| Full-library import is slow or rate-limited | Medium | §5.1 `append_to_response` + §5.6 cache so retries are cheap |
+| Early scraping from date-only `air_date` | Medium | §5.3 +1 day default, tunable |
+| Library items TMDB can't match by IMDb | Low | §5.5 — log the list at end of rebuild |
 
 ---
 
-## 10. Checklist
+## 11. Checklist
 
-- [ ] §4.1 ID scheme confirmed (recommendation: option B)
-- [ ] §4.7 air-date behaviour confirmed (recommendation: option i)
-- [ ] §8 decision on `TraktContent` — keeping or replacing
+- [x] Existing DB — hard reset, rebuild from symlinks
+- [x] ID scheme — IMDb-keyed
+- [x] Air-date handling — `air_date` + 1 day, tunable
+- [x] Anime — minimal heuristic, no keyword call
+- [x] Trakt — delete entirely
 - [ ] A — `apis/tmdb_api.py` + DI registration
-- [ ] B — `services/indexers/tmdb.py`
-- [ ] C — Alembic migration, tested on a DB copy
-- [ ] D — call sites swapped
-- [ ] E — settings + env
-- [ ] F — fixtures and tests
-- [ ] G — Trakt indexer teardown
-- [ ] H — docs and changelog
-- [ ] §7 verification run end to end
+- [ ] B — `services/indexers/tmdb.py`, call sites swapped
+- [ ] C — external-ID resolution → TMDB
+- [ ] D — settings, env, drop `trakt_id`
+- [ ] §7 — Trakt removed
+- [ ] E — fixtures, `test_symlink_rebuild.py`
+- [ ] §5.4 diff built and reviewed
+- [ ] §8 cutover runbook executed
+- [ ] F — docs and changelog

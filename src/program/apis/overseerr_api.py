@@ -5,7 +5,7 @@ from loguru import logger
 from requests.exceptions import ConnectionError, RetryError
 from urllib3.exceptions import MaxRetryError
 
-from program.apis.trakt_api import TraktAPI
+from program.apis.tmdb_api import TMDBAPI
 from program.media.item import MediaItem
 from program.settings.manager import settings_manager
 from program.utils.request import (
@@ -37,7 +37,7 @@ class OverseerrAPI:
         self.api_key = api_key
         rate_limit_params = get_rate_limit_params(max_calls=1000, period=300)
         session = create_service_session(rate_limit_params=rate_limit_params)
-        self.trakt_api = di[TraktAPI]
+        self.tmdb_api = di[TMDBAPI]
         self.headers = {"X-Api-Key": self.api_key}
         session.headers.update(self.headers)
         self.request_handler = OverseerrRequestHandler(session, base_url=base_url)
@@ -113,7 +113,7 @@ class OverseerrAPI:
             return imdb_id
 
         # Try alternate IDs if IMDb ID is not available
-        alternate_ids = [("tmdbId", self.trakt_api.get_imdbid_from_tmdb)]
+        alternate_ids = [("tmdbId", self.tmdb_api.get_imdbid_from_tmdb)]
         for id_attr, fetcher in alternate_ids:
             external_id_value = getattr(response.data.externalIds, id_attr, None)
             if external_id_value:

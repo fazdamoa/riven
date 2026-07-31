@@ -2,7 +2,7 @@
 from loguru import logger
 from requests.exceptions import HTTPError
 
-from program.apis.trakt_api import TraktAPI
+from program.apis.tmdb_api import TMDBAPI
 from program.media.item import MediaItem
 from program.utils.request import (
     BaseRequestHandler,
@@ -34,7 +34,7 @@ class ListrrAPI:
         session = create_service_session()
         session.headers.update(self.headers)
         self.request_handler = ListrrRequestHandler(session, base_url=self.BASE_URL)
-        self.trakt_api = di[TraktAPI]
+        self.tmdb_api = di[TMDBAPI]
 
     def validate(self):
         return self.request_handler.execute(HttpMethod.GET, "")
@@ -60,7 +60,7 @@ class ListrrAPI:
 
                         try:
                             imdb_id = item.imDbId or (
-                                self.trakt_api.get_imdbid_from_tmdb(item.tmDbId) 
+                                self.tmdb_api.get_imdbid_from_tmdb(item.tmDbId) 
                                 if content_type == "Movies" and item.tmDbId 
                                 else None
                             )

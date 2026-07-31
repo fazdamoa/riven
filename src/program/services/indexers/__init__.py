@@ -1,1 +1,1 @@
-from .trakt import TraktIndexer  # noqa
+from .tmdb import TMDBIndexer  # noqa

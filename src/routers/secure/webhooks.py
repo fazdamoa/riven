@@ -6,7 +6,7 @@ from kink import di
 from loguru import logger
 from requests import RequestException
 
-from program.apis.trakt_api import TraktAPI
+from program.apis.tmdb_api import TMDBAPI
 from program.media.item import MediaItem
 from program.services.content.overseerr import Overseerr
 
@@ -49,15 +49,15 @@ async def overseerr(request: Request) -> Dict[str, Any]:
 def get_imdbid_from_overseerr(req: OverseerrWebhook) -> str:
     """Get the imdb_id from the Overseerr webhook"""
     imdb_id = req.media.imdbId
-    trakt_api = di[TraktAPI]
+    tmdb_api = di[TMDBAPI]
     if not imdb_id:
         try:
             _type = req.media.media_type
             if _type == "tv":
                 _type = "show"
-            imdb_id = trakt_api.get_imdbid_from_tmdb(str(req.media.tmdbId), type=_type)
+            imdb_id = tmdb_api.get_imdbid_from_tmdb(str(req.media.tmdbId), type=_type)
             if not imdb_id or not imdb_id.startswith("tt"):
-                imdb_id = trakt_api.get_imdbid_from_tvdb(str(req.media.tvdbId), type=_type)
+                imdb_id = tmdb_api.get_imdbid_from_tvdb(str(req.media.tvdbId), type=_type)
         except RequestException:
             pass
     return imdb_id

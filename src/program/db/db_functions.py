@@ -2,7 +2,6 @@ import os
 import shutil
 import alembic
 
-from loguru import logger
 from threading import Event
 from typing import TYPE_CHECKING, Optional
 from datetime import datetime, timedelta
@@ -14,6 +13,12 @@ from program.services.libraries.symlink import fix_broken_symlinks
 from program.settings.manager import settings_manager
 from program.utils import root_dir
 from program.media.state import States
+# Import the logger from our logging module rather than loguru directly: importing
+# it runs setup_logger(), which registers the custom levels ("DATABASE" et al).
+# The HARD_RESET / REPAIR_SYMLINKS blocks at the bottom of this module run at
+# import time, before anything else has set logging up, and would otherwise die
+# with `ValueError: Level 'DATABASE' does not exist`.
+from program.utils.logging import logger
 
 from .db import db
 
@@ -27,9 +32,12 @@ def get_item_by_id(item_id: str, item_types: list[str] = None, session: Session 
         return None
 
     from program.media.item import MediaItem, Season, Show
+    # Only close a session we created. Using `with` on a caller-supplied session
+    # closes it, which silently discards everything the caller had pending.
+    owns_session = session is None
     _session = session if session else db.Session()
 
-    with _session:
+    try:
         query = (select(MediaItem)
             .where(MediaItem.id == item_id)
             .options(
@@ -43,6 +51,9 @@ def get_item_by_id(item_id: str, item_types: list[str] = None, session: Session 
         if item:
             _session.expunge(item)
         return item
+    finally:
+        if owns_session:
+            _session.close()
 
 def get_items_by_ids(ids: list, item_types: list[str] = None, session: Session = None) -> list["MediaItem"]:
     """Get a list of MediaItems by their IDs."""
@@ -55,6 +66,7 @@ def get_item_by_external_id(imdb_id: str = None, tvdb_id: int = None, tmdb_id: i
     """Get a MediaItem by its external ID."""
     from program.media.item import MediaItem, Season, Show
 
+    owns_session = session is None
     _session = session if session else db.Session()
     query = (
         select(MediaItem)
@@ -74,11 +86,14 @@ def get_item_by_external_id(imdb_id: str = None, tvdb_id: int = None, tmdb_id: i
     else:
         raise ValueError("One of the external ids must be given")
 
-    with _session:
+    try:
         item = _session.execute(query).unique().scalar_one_or_none()
         if item:
             _session.expunge(item)
         return item
+    finally:
+        if owns_session:
+            _session.close()
 
 def delete_media_item(item: "MediaItem"):
     """Delete a MediaItem and all its associated relationships."""
@@ -295,23 +310,28 @@ def get_item_ids(session: Session, item_id: str) -> tuple[str, list[str]]:
 def get_item_by_symlink_path(filepath: str, session: Session = None) -> list["MediaItem"]:
     """Get a list of MediaItems by their symlink path."""
     from program.media.item import MediaItem
+    owns_session = session is None
     _session = session if session else db.Session()
 
-    with _session:
+    try:
         items = _session.execute(
             select(MediaItem).where(MediaItem.symlink_path == filepath)
         ).unique().scalars().all()
         for item in items:
             _session.expunge(item)
         return items
+    finally:
+        if owns_session:
+            _session.close()
 
 def get_item_by_imdb_and_episode(imdb_id: str, season_number: Optional[int] = None, episode_number: Optional[int] = None, session: Session = None) -> list["MediaItem"]:
     """Get a MediaItem by its IMDb ID and optionally season and episode numbers."""
     from program.media.item import Episode, Movie, Season, Show
 
+    owns_session = session is None
     _session = session if session else db.Session()
 
-    with _session:
+    try:
         if season_number is not None and episode_number is not None:
             # Look for an episode
             items = _session.execute(
@@ -332,6 +352,9 @@ def get_item_by_imdb_and_episode(imdb_id: str, season_number: Optional[int] = No
         for item in items:
             _session.expunge(item)
         return items
+    finally:
+        if owns_session:
+            _session.close()
 
 def retry_library(session) -> list[str]:
     """Retry items that failed to download."""
@@ -408,7 +431,6 @@ def create_calendar(session: Session) -> dict:
     calendar = {}
     for item in results:
         calendar[item.id] = {}
-        calendar[item.id]["trakt_id"] = item.trakt_id
         calendar[item.id]["imdb_id"] = item.imdb_id
         calendar[item.id]["tvdb_id"] = item.tvdb_id
         calendar[item.id]["tmdb_id"] = item.tmdb_id
@@ -615,19 +637,11 @@ def hard_reset_database_pre_migration() -> None:
 
     logger.log("DATABASE", "Pre Migration - Hard Reset Complete")
 
-# Hard Reset Database
-reset = os.getenv("HARD_RESET", None)
-if reset is not None and reset.lower() in ["true","1"]:
-    hard_reset_database()
-    exit(0)
-
-# Hard Reset Database
-reset = os.getenv("HARD_RESET_PRE_MIGRATION", None)
-if reset is not None and reset.lower() in ["true","1"]:
-    hard_reset_database_pre_migration()
-    exit(0)
-
-# Repair Symlinks
-if os.getenv("REPAIR_SYMLINKS", None) is not None and os.getenv("REPAIR_SYMLINKS").lower() in ["true","1"]:
-    fix_broken_symlinks(settings_manager.settings.symlink.library_path, settings_manager.settings.symlink.rclone_path)
-    exit(0)
+# NOTE: the HARD_RESET / HARD_RESET_PRE_MIGRATION / REPAIR_SYMLINKS environment
+# variables used to be handled here, at module scope. That ran during the import
+# of program.media.item (which imports this module), i.e. *before* MediaItem,
+# Movie, Show, Season and Episode were registered on db.Model.metadata - so
+# create_all() saw Subtitle's foreign key to a MediaItem table it didn't know
+# about and died with NoReferencedTableError, after having already dropped the
+# schema. They are now handled in program.utils.cli.handle_args(), which main.py
+# calls once every model is imported. See also the equivalent --hard_reset_db flags.

@@ -152,7 +152,11 @@ def process_shows(directory: Path, item_type: str, is_anime: bool = False) -> Ge
             if directory not in POSSIBLE_DIRS:
                 logger.debug(f"Skipping {directory} as it's not a valid media directory.")
                 continue
-            if os.path.splitext(season)[1][1:] not in ALLOWED_VIDEO_EXTENSIONS:
+            # Seasons are directories, not video files. This used to test the
+            # season name against ALLOWED_VIDEO_EXTENSIONS, which no directory can
+            # ever satisfy ("Season 01" has no extension) - so every season was
+            # skipped and shows were rebuilt from symlinks with no episodes at all.
+            if not (directory / show / season).is_dir():
                 continue
             if not (season_number := re.search(r"(\d+)", season)):
                 logger.log("NOT_FOUND", f"Can't extract season number at path {directory / show / season}")

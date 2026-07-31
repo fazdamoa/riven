@@ -6,19 +6,21 @@ from .listrr_api import ListrrAPI, ListrrAPIError
 from .mdblist_api import MdblistAPI, MdblistAPIError
 from .overseerr_api import OverseerrAPI, OverseerrAPIError
 from .plex_api import PlexAPI, PlexAPIError
-from .trakt_api import TraktAPI, TraktAPIError
+from .tmdb_api import TMDBAPI, TMDBAPIError
 
 
 def bootstrap_apis():
-    __setup_trakt()
+    __setup_tmdb()
     __setup_plex()
     __setup_mdblist()
     __setup_overseerr()
     __setup_listrr()
 
-def __setup_trakt():
-    traktApi = TraktAPI(settings_manager.settings.content.trakt)
-    di[TraktAPI] = traktApi
+def __setup_tmdb():
+    # Registered unconditionally - the indexer is not optional, and external id
+    # resolution needs this too.
+    tmdbApi = TMDBAPI(settings_manager.settings.indexer.tmdb)
+    di[TMDBAPI] = tmdbApi
 
 def __setup_plex():
     if not settings_manager.settings.updaters.plex.enabled:

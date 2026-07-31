@@ -1,4 +1,5 @@
 import argparse
+import os
 
 from program.db.db_functions import (
     hard_reset_database,
@@ -44,6 +45,27 @@ def handle_args():
     )
 
     args = parser.parse_args()
+
+    # Environment-variable equivalents of the flags below. These are handled here
+    # rather than at import time in db_functions so that every model is registered
+    # on db.Model.metadata before the schema is dropped and recreated.
+    def env_flag(name: str) -> bool:
+        value = os.getenv(name)
+        return value is not None and value.lower() in ("true", "1")
+
+    if env_flag("HARD_RESET"):
+        hard_reset_database()
+        logger.info("Hard reset the database")
+        exit(0)
+
+    if env_flag("HARD_RESET_PRE_MIGRATION"):
+        hard_reset_database_pre_migration()
+        logger.info("Hard reset the database")
+        exit(0)
+
+    if env_flag("REPAIR_SYMLINKS"):
+        fix_broken_symlinks(settings_manager.settings.symlink.library_path, settings_manager.settings.symlink.rclone_path)
+        exit(0)
 
     if args.hard_reset_db:
         hard_reset_database()

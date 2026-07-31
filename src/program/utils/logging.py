@@ -51,7 +51,6 @@ def setup_logger(level):
         "LOCAL": (48, "DAD3BE", "📽️ "),
         "JELLYFIN": (48, "DAD3BE", "📽️ "),
         "EMBY": (48, "DAD3BE", "📽️ "),
-        "TRAKT": (48, "1DB954", "🎵"),
     }
 
     # Set log levels

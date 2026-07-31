@@ -2,12 +2,10 @@ from typing import Literal
 
 import requests
 from fastapi import APIRouter, HTTPException, Request
-from kink import di
 from loguru import logger
 from pydantic import BaseModel, Field, HttpUrl
 from sqlalchemy import func, select
 
-from program.apis import TraktAPI
 from program.db.db import db
 from program.media.item import Episode, MediaItem, Movie, Season, Show
 from program.media.state import States
@@ -83,33 +81,6 @@ async def get_services(request: Request) -> dict[str, bool]:
                 data[sub_service.key] = sub_service.initialized
     return data
 
-
-class TraktOAuthInitiateResponse(BaseModel):
-    auth_url: str
-
-
-@router.get("/trakt/oauth/initiate", operation_id="trakt_oauth_initiate")
-async def initiate_trakt_oauth(request: Request) -> TraktOAuthInitiateResponse:
-    trakt_api = di[TraktAPI]
-    if trakt_api is None:
-        raise HTTPException(status_code=404, detail="Trakt service not found")
-    auth_url = trakt_api.perform_oauth_flow()
-    return {"auth_url": auth_url}
-
-
-@router.get("/trakt/oauth/callback", operation_id="trakt_oauth_callback")
-async def trakt_oauth_callback(code: str, request: Request) -> MessageResponse:
-    trakt_api = di[TraktAPI]
-    trakt_api_key = settings_manager.settings.content.trakt.api_key
-    if trakt_api is None:
-        raise HTTPException(status_code=404, detail="Trakt Api not found")
-    if trakt_api_key is None:
-        raise HTTPException(status_code=404, detail="Trakt Api key not found in settings")
-    success = trakt_api.handle_oauth_callback(trakt_api_key, code)
-    if success:
-        return {"message": "OAuth token obtained successfully"}
-    else:
-        raise HTTPException(status_code=400, detail="Failed to obtain OAuth token")
 
 
 class StatsResponse(BaseModel):

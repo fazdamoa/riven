@@ -22,7 +22,6 @@ class MediaItem(db.Model):
     """MediaItem class"""
     __tablename__ = "MediaItem"
     id: Mapped[str] = mapped_column(sqlalchemy.String, primary_key=True)
-    trakt_id: Mapped[Optional[str]] = mapped_column(sqlalchemy.String, nullable=True)
     imdb_id: Mapped[Optional[str]] = mapped_column(sqlalchemy.String, nullable=True)
     tvdb_id: Mapped[Optional[str]] = mapped_column(sqlalchemy.String, nullable=True)
     tmdb_id: Mapped[Optional[str]] = mapped_column(sqlalchemy.String, nullable=True)
@@ -109,7 +108,6 @@ class MediaItem(db.Model):
 
         # Media related
         self.title = item.get("title")
-        self.trakt_id = item.get("trakt_id")
         self.imdb_id =  item.get("imdb_id")
         if self.imdb_id:
             self.imdb_link = f"https://www.imdb.com/title/{self.imdb_id}/"
@@ -134,14 +132,43 @@ class MediaItem(db.Model):
         # Post-processing
         self.subtitles = item.get("subtitles", [])
 
-    @staticmethod
-    def __generate_composite_key(item: dict) -> str | None:
-        """Generate a composite key for the item."""
-        trakt_id = item.get("trakt_id", None)
-        if not trakt_id:
+    def __generate_composite_key(self, item: dict) -> str | None:
+        """Generate a composite key for the item.
+
+        Keyed on the IMDb id, which is what the rest of the pipeline uses, with a
+        TMDB fallback for the handful of titles TMDB has no IMDb mapping for.
+
+        Only movies and shows are keyed here:
+          - seasons and episodes derive theirs from the parent, in
+            Show.add_season / Season.add_episode, which is the first point at
+            which the parent is known;
+          - bare MediaItem stubs from the content services must keep a null id so
+            the event loop routes them as content items to be indexed, rather
+            than looking them up in the database.
+
+        Subclasses set `self.type` before calling super().__init__, so prefer that
+        over the dict - callers like SymlinkLibrary build items without a "type" key.
+        """
+        item_type = getattr(self, "type", None) or item.get("type", "unknown")
+        if item_type not in ("movie", "show"):
             return None
-        item_type = item.get("type", "unknown")
-        return f"{item_type}_{trakt_id}"
+
+        if imdb_id := item.get("imdb_id"):
+            return f"{item_type}_{imdb_id}"
+        if tmdb_id := item.get("tmdb_id"):
+            return f"{item_type}_tmdb{tmdb_id}"
+        return None
+
+    @property
+    def external_key(self) -> str | None:
+        """The external-id portion of this item's composite key.
+
+        `show_tt0903747` -> `tt0903747`, `season_tt0903747_1` -> `tt0903747_1`.
+        Children append their own number to it, so ids nest naturally.
+        """
+        if not self.id or "_" not in self.id:
+            return None
+        return self.id.split("_", 1)[1]
 
     def store_state(self, given_state=None) -> tuple[States, States]:
         """Store the state of the item."""
@@ -262,16 +289,14 @@ class MediaItem(db.Model):
         season_number = None
         episode_number = None
         parent_ids = {
-            "trakt_id": self.tmdb_id if hasattr(self, "tmdb_id") else None,
             "imdb_id": self.imdb_id if hasattr(self, "imdb_id") else None,
             "tvdb_id": self.tvdb_id if hasattr(self, "tvdb_id") else None,
-            "tmdb_id": self.tvdb_id if hasattr(self, "tvdb_id") else None
+            "tmdb_id": self.tmdb_id if hasattr(self, "tmdb_id") else None
         }
 
         if self.type == "season":
             parent_title = self.parent.title
             season_number = self.number
-            parent_ids["trakt_id"] = self.parent.trakt_id if hasattr(self, "parent") and hasattr(self.parent, "trakt_id") else None
             parent_ids["imdb_id"] = self.parent.imdb_id if hasattr(self, "parent") and hasattr(self.parent, "imdb_id") else None
             parent_ids["tvdb_id"] = self.parent.tvdb_id if hasattr(self, "parent") and hasattr(self.parent, "tvdb_id") else None
             parent_ids["tmdb_id"] = self.parent.tmdb_id if hasattr(self, "parent") and hasattr(self.parent, "tmdb_id") else None
@@ -279,7 +304,6 @@ class MediaItem(db.Model):
             parent_title = self.parent.parent.title
             season_number = self.parent.number
             episode_number = self.number
-            parent_ids["trakt_id"] = self.parent.parent.trakt_id if hasattr(self, "parent") and hasattr(self.parent, "trakt_id") else None
             parent_ids["imdb_id"] = self.parent.parent.imdb_id if hasattr(self, "parent") and hasattr(self.parent, "parent") and hasattr(self.parent.parent, "imdb_id") else None
             parent_ids["tvdb_id"] = self.parent.parent.tvdb_id if hasattr(self, "parent") and hasattr(self.parent, "parent") and hasattr(self.parent.parent, "tvdb_id") else None
             parent_ids["tmdb_id"] = self.parent.parent.tmdb_id if hasattr(self, "parent") and hasattr(self.parent, "parent") and hasattr(self.parent.parent, "tmdb_id") else None
@@ -291,7 +315,6 @@ class MediaItem(db.Model):
             "parent_title": parent_title,
             "season_number": season_number,
             "episode_number": episode_number,
-            "trakt_id": self.trakt_id if hasattr(self, "trakt_id") else None,
             "imdb_id": self.imdb_id if hasattr(self, "imdb_id") else None,
             "tvdb_id": self.tvdb_id if hasattr(self, "tvdb_id") else None,
             "tmdb_id": self.tmdb_id if hasattr(self, "tmdb_id") else None,
@@ -621,6 +644,7 @@ class Show(MediaItem):
             season.is_anime = self.is_anime
             self.seasons.append(season)
             season.parent = self
+            season.assign_id_from_parent()
             self.seasons = sorted(self.seasons, key=lambda s: s.number)
 
     def propagate_attributes_to_childs(self):
@@ -687,6 +711,19 @@ class Season(MediaItem):
         super().__init__(item)
         if self.parent and isinstance(self.parent, Show):
             self.is_anime = self.parent.is_anime
+
+    def assign_id_from_parent(self):
+        """Derive this season's id from its show, then re-derive its episodes'.
+
+        Episodes are often attached before the season itself is added to a show,
+        so this has to cascade rather than assume ids already exist.
+        """
+        if not self.parent or self.number is None:
+            return
+        if parent_key := self.parent.external_key:
+            self.id = f"season_{parent_key}_{self.number}"
+            for episode in self.episodes:
+                episode.assign_id_from_parent()
 
     def _determine_state(self):
         if len(self.episodes) > 0:
@@ -761,6 +798,7 @@ class Season(MediaItem):
         episode.is_anime = self.is_anime
         self.episodes.append(episode)
         episode.parent = self
+        episode.assign_id_from_parent()
         self.episodes = sorted(self.episodes, key=lambda e: e.number)
 
     @property
@@ -794,6 +832,13 @@ class Episode(MediaItem):
         super().__init__(item)
         if self.parent and isinstance(self.parent, Season):
             self.is_anime = self.parent.parent.is_anime
+
+    def assign_id_from_parent(self):
+        """Derive this episode's id from its season (see Season.assign_id_from_parent)."""
+        if not self.parent or self.number is None:
+            return
+        if parent_key := self.parent.external_key:
+            self.id = f"episode_{parent_key}_{self.number}"
 
     def __repr__(self):
         return f"Episode:{self.number}:{self.state.name}"

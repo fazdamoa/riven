@@ -16,7 +16,7 @@ from program.db.db import db
 from program.media.item import MediaItem
 from program.media.stream import Stream as ItemStream
 from program.services.downloaders import Downloader
-from program.services.indexers.trakt import TraktIndexer
+from program.services.indexers.tmdb import TMDBIndexer
 from program.services.scrapers import Scraping
 from program.services.scrapers.shared import manual_rtn
 from program.types import Event
@@ -216,7 +216,7 @@ def scrape_item(request: Request, id: str) -> ScrapeItemResponse:
         item_id = id
 
     if services := request.app.program.services:
-        indexer = services[TraktIndexer]
+        indexer = services[TMDBIndexer]
         scraper = services[Scraping]
     else:
         raise HTTPException(status_code=412, detail="Scraping services not initialized")
@@ -279,7 +279,7 @@ async def start_manual_session(
         item_id = item_id
 
     if services := request.app.program.services:
-        indexer = services[TraktIndexer]
+        indexer = services[TMDBIndexer]
         downloader = services[Downloader]
     else:
         raise HTTPException(status_code=412, detail="Required services not initialized")
@@ -505,9 +505,9 @@ async def manual_update_attributes(request: Request, session_id, data: Union[Deb
             
             if not item:
                 # Item not in DB yet, need to index it
-                logger.debug(f"[ManualScrape] Item not found, indexing from Trakt...")
+                logger.debug(f"[ManualScrape] Item not found, indexing from TMDB...")
                 prepared_item = MediaItem({"imdb_id": session.item_id})
-                item = next(TraktIndexer().run(prepared_item))
+                item = next(TMDBIndexer().run(prepared_item))
                 if not item:
                     raise HTTPException(status_code=404, detail="Unable to index item")
                 logger.debug(f"[ManualScrape] Indexed item: {item.log_string}, saving to DB...")
